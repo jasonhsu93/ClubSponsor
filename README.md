@@ -1,6 +1,6 @@
 # ClubSponsor
 
-Build a CSV lead list of sponsorship contacts for student clubs at the top 10 Canadian universities
+Build a CSV lead list of sponsorship contacts for student clubs at a Canadian university using [Parallel AI](https://parallel.ai).
 
 ## First-Time Setup
 
@@ -25,17 +25,24 @@ Each stage checkpoints its output so you can stop/resume at any point.
 # Smoke test — verify API key works (1 Search + 1 Chat call)
 python lead_scraper.py --test
 
-# Run all 4 stages end-to-end
+# Run all 4 stages end-to-end (defaults to UBC)
 python lead_scraper.py --all
 
+# Target a different university
+python lead_scraper.py --all --university "McGill University"
+
 # Or run stages individually
-python lead_scraper.py --stage 1              # Identify top 10 universities
-python lead_scraper.py --stage 2 --max-clubs 100   # Enumerate clubs (≤100/school)
-python lead_scraper.py --stage 3 --batch-size 10    # Look up sponsorship contacts
+python lead_scraper.py --stage 1              # Resolve directory URL
+python lead_scraper.py --stage 2              # Enumerate clubs (≤100)
+python lead_scraper.py --stage 3              # Find contacts (Task Group API)
 python lead_scraper.py --stage 4              # Validate, deduplicate, export CSV
 
-# Resume a stage that was interrupted
+# Resume Stage 3 if interrupted
 python lead_scraper.py --stage 3 --resume
+
+# Cap clubs or use a different Task processor
+python lead_scraper.py --all --max-clubs 50
+python lead_scraper.py --all --processor lite-fast
 ```
 
 ## Output
@@ -63,8 +70,8 @@ python lead_scraper.py --stage 3 --resume
 ## Project Structure
 
 ```
-api_client.py       # Parallel AI API wrapper (Search, Extract, Chat)
-lead_scraper.py     # 4-stage pipeline + CLI
+api_client.py       # Parallel AI API wrapper (Search, Extract, Chat, Task Group)
+lead_scraper.py     # 4-stage pipeline + CLI (v2)
 requirements.txt    # Python dependencies
 PLAN.md             # Architecture & API reference
 .env.example        # Template for API key

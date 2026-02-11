@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-lead_scraper.py - Canadian Club Sponsorship Lead List Builder
+lead_scraper.py - Canadian Club Sponsorship Lead List Builder (v2)
 
-Uses Parallel AI's Search, Extract, and Chat APIs to:
-1. Identify top 10 Canadian universities with 25+ student clubs
-2. Enumerate up to 100 clubs per university
-3. Find sponsorship contacts for each club
+Uses Parallel AI's Search, Extract, Chat, and Task Group APIs to:
+1. Resolve the target university's clubs directory URL
+2. Enumerate up to 100 clubs at that university
+3. Find sponsorship contacts for each club via Task Group (base-fast)
 4. Validate and export to CSV
 
 Usage:
-    python lead_scraper.py --test                  # Smoke test API key
-    python lead_scraper.py --stage 1               # Run stage 1
-    python lead_scraper.py --stage 2               # Run stage 2
-    python lead_scraper.py --stage 3               # Run stage 3
-    python lead_scraper.py --stage 4               # Run stage 4
-    python lead_scraper.py --all                   # Run all stages 1-4
-    python lead_scraper.py --stage 3 --resume      # Resume from checkpoint
-    python lead_scraper.py --max-clubs 50 --all    # Cap clubs per school
+    python lead_scraper.py --test                                 # Smoke test API key
+    python lead_scraper.py --stage 1                              # Run stage 1
+    python lead_scraper.py --stage 2                              # Run stage 2
+    python lead_scraper.py --stage 3                              # Run stage 3
+    python lead_scraper.py --stage 4                              # Run stage 4
+    python lead_scraper.py --all                                  # Run all stages 1-4
+    python lead_scraper.py --all --university "McGill University"  # Different uni
+    python lead_scraper.py --stage 3 --resume                     # Resume from checkpoint
+    python lead_scraper.py --max-clubs 50 --all                   # Cap clubs
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -55,6 +58,27 @@ if not logger.handlers:
 
 
 # ---------------------------------------------------------------------------
+# Well-known club directory URLs (saves an API call when available)
+# ---------------------------------------------------------------------------
+KNOWN_DIRECTORIES: dict[str, str] = {
+    "University of British Columbia": "https://amscampusbase.ubc.ca/club_signup",
+    "University of Toronto": "https://www.ulife.utoronto.ca/organizations",
+    "McGill University": "https://involvement.mcgill.ca/club-search",
+    "University of Alberta": "https://campusconnect.ualberta.ca/organizations",
+    "McMaster University": "https://msumcmaster.ca/clubs/",
+    "Western University": "https://westernu.campuslabs.ca/engage/organizations",
+    "Queen's University": "https://queensu.campuslabs.ca/engage/organizations",
+    "University of Waterloo": "https://wusa.ca/clubs/",
+    "University of Calgary": "https://www.ucalgary.ca/student-services/student-groups",
+    "University of Ottawa": "https://www.uottawa.ca/campus-life/clubs-associations",
+    "York University": "https://yorku.campuslabs.ca/engage/organizations",
+    "Simon Fraser University": "https://go.sfss.ca/clubs/list",
+    "Dalhousie University": "https://dsu.ca/clubs-societies",
+    "University of Manitoba": "https://umsu.ca/clubs/",
+}
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
@@ -70,7 +94,10 @@ def load_checkpoint(filepath):
     if os.path.exists(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
-        logger.info(f"Checkpoint loaded: {filepath} ({len(data) if isinstance(data, list) else 'dict'})")
+        logger.info(
+            f"Checkpoint loaded: {filepath} "
+            f"({len(data) if isinstance(data, list) else 'dict'})"
+        )
         return data
     return None
 
@@ -121,17 +148,19 @@ def run_smoke_test(client: ParallelClient):
             },
         }
         parsed, basis = client.chat_json(
-            prompt="List 3 Canadian universities known for having the most student clubs. Include estimated club count.",
+            prompt=(
+                "List 3 Canadian universities known for having the most "
+                "student clubs. Include estimated club count."
+            ),
             schema=schema,
             schema_name="test_universities",
             model="base",
         )
-        print(f"✅ Chat API works! Parsed JSON response:")
+        source_urls = ParallelClient.extract_source_urls(basis)
+        print("✅ Chat API works! Parsed JSON response:")
         print(f"   {json.dumps(parsed, indent=2)[:500]}")
         print(f"   Basis citations: {len(basis)}")
-        if basis:
-            for b in basis[:2]:
-                print(f"     - {json.dumps(b)[:120]}")
+        print(f"   Extracted source URLs: {source_urls[:3]}")
     except Exception as e:
         print(f"❌ Chat API failed: {e}")
         return False
@@ -142,167 +171,108 @@ def run_smoke_test(client: ParallelClient):
 
 
 # =========================================================================
-# STAGE 1: Identify Top 10 Universities
+# STAGE 1: Resolve University Directory URL
 # =========================================================================
 
-STAGE1_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "universities": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "university": {"type": "string", "description": "Full official name of the university"},
-                    "province": {"type": "string", "description": "Canadian province"},
-                    "estimated_club_count": {"type": "integer", "description": "Estimated number of student clubs"},
-                    "clubs_directory_url": {"type": "string", "description": "URL of the official student clubs directory page"},
-                },
-                "required": ["university", "province", "estimated_club_count"],
-            },
-        }
-    },
-    "required": ["universities"],
-}
+def run_stage1(client: ParallelClient, university: str) -> list[dict]:
+    """Resolve the target university's clubs directory URL.
 
-
-def run_stage1(client: ParallelClient) -> list[dict]:
-    """Identify top 10 Canadian universities with 25+ student clubs."""
+    If the university is in KNOWN_DIRECTORIES, we use the cached URL.
+    Otherwise, we use Search + Chat to find it.
+    """
     print("\n" + "=" * 60)
-    print("STAGE 1: Identify Top 10 Canadian Universities")
+    print(f"STAGE 1: Resolve Directory URL for {university}")
     print("=" * 60)
 
-    # -------------------------------------------------------------------
-    # Strategy: We KNOW the large Canadian universities. The model struggles
-    # to return accurate club counts for all of them in a single query.
-    # Instead, we'll:
-    #   1. Start with a known list of 15 large Canadian universities
-    #   2. Use Search + Chat to find each university's clubs directory URL
-    #      and verify they have 25+ clubs
-    #   3. Take the top 10
-    # -------------------------------------------------------------------
+    # Check known directories first
+    known_url = KNOWN_DIRECTORIES.get(university, "")
 
-    candidate_universities = [
-        {"university": "University of Toronto", "province": "Ontario"},
-        {"university": "University of British Columbia", "province": "British Columbia"},
-        {"university": "McGill University", "province": "Quebec"},
-        {"university": "University of Alberta", "province": "Alberta"},
-        {"university": "McMaster University", "province": "Ontario"},
-        {"university": "Western University", "province": "Ontario"},
-        {"university": "Queen's University", "province": "Ontario"},
-        {"university": "University of Waterloo", "province": "Ontario"},
-        {"university": "University of Calgary", "province": "Alberta"},
-        {"university": "University of Ottawa", "province": "Ontario"},
-        {"university": "York University", "province": "Ontario"},
-        {"university": "Toronto Metropolitan University", "province": "Ontario"},
-        {"university": "Simon Fraser University", "province": "British Columbia"},
-        {"university": "Dalhousie University", "province": "Nova Scotia"},
-        {"university": "University of Manitoba", "province": "Manitoba"},
-    ]
+    if known_url:
+        print(f"  ✅ Known directory URL: {known_url}")
+        uni_data = {
+            "university": university,
+            "province": "",
+            "estimated_club_count": 0,
+            "clubs_directory_url": known_url,
+            "source_urls": [],
+        }
+    else:
+        # Search for the directory URL
+        print("  🔍 Searching for clubs directory...")
+        search_result = client.search(
+            objective=(
+                f"Find the official student clubs directory or list of "
+                f"student organizations at {university} in Canada"
+            ),
+            search_queries=[
+                f"{university} student clubs list directory",
+                f"{university} student organizations directory",
+                f"{university} student union clubs",
+            ],
+            max_results=5,
+        )
 
-    # Use a single Chat call to look up club directory URLs and counts for all
-    uni_names = "\n".join(f"- {u['university']} ({u['province']})" for u in candidate_universities)
+        # Use Chat to pick the best URL
+        search_urls = [
+            r.get("url", "") for r in search_result.get("results", [])
+            if r.get("url")
+        ]
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "universities": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "university": {"type": "string"},
-                        "province": {"type": "string"},
-                        "estimated_club_count": {"type": "integer", "description": "Estimated number of student clubs. Use 0 only if you truly cannot find any information."},
-                        "clubs_directory_url": {"type": "string", "description": "The URL of the student clubs directory or listing page"},
-                    },
-                    "required": ["university", "province", "estimated_club_count", "clubs_directory_url"],
+        schema = {
+            "type": "object",
+            "properties": {
+                "university": {"type": "string"},
+                "province": {"type": "string"},
+                "estimated_club_count": {
+                    "type": "integer",
+                    "description": "Estimated number of student clubs",
                 },
-            }
-        },
-        "required": ["universities"],
-    }
+                "clubs_directory_url": {
+                    "type": "string",
+                    "description": "The URL of the student clubs directory page",
+                },
+            },
+            "required": [
+                "university", "province",
+                "estimated_club_count", "clubs_directory_url",
+            ],
+        }
 
-    prompt = (
-        "For each of the following Canadian universities, find:\n"
-        "1. The number of student clubs/organizations (search their student union/student life website)\n"
-        "2. The URL of their official student clubs directory or clubs listing page\n\n"
-        "Universities:\n"
-        f"{uni_names}\n\n"
-        "Important: Most large Canadian universities have between 100 and 500+ student clubs. "
-        "If you cannot find an exact number, provide your best estimate based on the university's "
-        "size and what you find on their website. Do NOT return 0 unless the university truly has "
-        "no clubs directory."
-    )
+        url_list = "\n".join(f"  - {u}" for u in search_urls[:5])
+        parsed, basis = client.chat_json(
+            prompt=(
+                f"For {university} (Canada), find:\n"
+                f"1. The province it's in\n"
+                f"2. Estimated number of student clubs\n"
+                f"3. The best URL for their student clubs directory\n\n"
+                f"Candidate URLs from search:\n{url_list}\n\n"
+                f"Pick the URL that leads to the actual clubs listing page."
+            ),
+            schema=schema,
+            schema_name="university_info",
+            model="base",
+        )
 
-    parsed, basis = client.chat_json(
-        prompt=prompt,
-        schema=schema,
-        schema_name="universities",
-        model="core",  # Use core for this critical first step — need thorough research
-        system_prompt=(
-            "You are a research assistant. For each university, search for their "
-            "student clubs directory page and count how many clubs are listed. "
-            "Return accurate URLs and club counts. Every large Canadian university "
-            "has at least 50-100 student clubs."
-        ),
-    )
+        source_urls = ParallelClient.extract_source_urls(basis)
+        uni_data = {
+            "university": parsed.get("university", university),
+            "province": parsed.get("province", ""),
+            "estimated_club_count": parsed.get("estimated_club_count", 0),
+            "clubs_directory_url": parsed.get("clubs_directory_url", ""),
+            "source_urls": source_urls,
+        }
+        print(f"  → Directory URL: {uni_data['clubs_directory_url']}")
+        print(f"  → Province: {uni_data['province']}")
+        print(f"  → Estimated clubs: {uni_data['estimated_club_count']}")
 
-    universities = parsed.get("universities", [])
-
-    # Extract source URLs from basis
-    source_urls = []
-    for b in basis:
-        if isinstance(b, dict):
-            if "citations" in b:
-                for cit in b["citations"]:
-                    if isinstance(cit, dict) and "url" in cit:
-                        source_urls.append(cit["url"])
-            for key in ("url", "source"):
-                if key in b:
-                    source_urls.append(b[key])
-
-    for u in universities:
-        u["source_urls"] = source_urls
-
-    # Filter to 25+ clubs, take top 10
-    qualified = [u for u in universities if u.get("estimated_club_count", 0) >= 25]
-    qualified.sort(key=lambda x: x.get("estimated_club_count", 0), reverse=True)
-
-    # If filtering removed too many (model returned 0s), fall back to taking all
-    # with a non-zero count, or even just the first 10 candidates
-    if len(qualified) < 10:
-        print(f"  ⚠ Only {len(qualified)} universities had 25+ clubs reported.")
-        # Add back universities with 0 count but valid directory URLs
-        for u in universities:
-            if u not in qualified and u.get("clubs_directory_url"):
-                u["estimated_club_count"] = 50  # reasonable default for large uni
-                qualified.append(u)
-        # If still not enough, add remaining candidates
-        if len(qualified) < 10:
-            existing_names = {u["university"] for u in qualified}
-            for c in candidate_universities:
-                if c["university"] not in existing_names and len(qualified) < 10:
-                    c["estimated_club_count"] = 50
-                    c["clubs_directory_url"] = ""
-                    c["source_urls"] = []
-                    qualified.append(c)
-
-    qualified = qualified[:10]
-
-    print(f"\nFound {len(qualified)} qualifying universities:")
-    for i, u in enumerate(qualified, 1):
-        print(f"  {i}. {u['university']} ({u['province']}) — ~{u.get('estimated_club_count', '?')} clubs")
-        if u.get("clubs_directory_url"):
-            print(f"     Directory: {u['clubs_directory_url']}")
-
-    save_checkpoint(qualified, STAGE1_FILE)
+    result = [uni_data]
+    save_checkpoint(result, STAGE1_FILE)
     print(f"\nTotal API calls so far: {client.call_count}")
-    return qualified
+    return result
 
 
 # =========================================================================
-# STAGE 2: Enumerate Clubs per University
+# STAGE 2: Enumerate Clubs at the University
 # =========================================================================
 
 STAGE2_SCHEMA = {
@@ -313,10 +283,26 @@ STAGE2_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "club_name": {"type": "string", "description": "Official name of the student club"},
-                    "club_description": {"type": "string", "description": "Brief description of the club's purpose"},
-                    "club_website": {"type": "string", "description": "Club's website or social media URL"},
-                    "club_category": {"type": "string", "description": "Category (e.g., Academic, Cultural, Sports, Professional, Social)"},
+                    "club_name": {
+                        "type": "string",
+                        "description": "Official name of the student club",
+                    },
+                    "club_description": {
+                        "type": "string",
+                        "description": "Brief description of the club's purpose",
+                    },
+                    "club_website": {
+                        "type": "string",
+                        "description": "Club's website or social media URL",
+                    },
+                    "club_category": {
+                        "type": "string",
+                        "description": (
+                            "Category: Academic, Cultural, Sports, Professional, "
+                            "Social, Political, Religious, Arts, Technology, "
+                            "Community Service, or Other"
+                        ),
+                    },
                 },
                 "required": ["club_name"],
             },
@@ -326,10 +312,14 @@ STAGE2_SCHEMA = {
 }
 
 
-def run_stage2(client: ParallelClient, max_clubs: int = 100, resume: bool = False) -> list[dict]:
-    """Enumerate up to max_clubs per university using Search + Extract + Chat."""
+def run_stage2(
+    client: ParallelClient,
+    max_clubs: int = 100,
+    resume: bool = False,
+) -> list[dict]:
+    """Enumerate up to max_clubs at the target university."""
     print("\n" + "=" * 60)
-    print("STAGE 2: Enumerate Clubs per University")
+    print("STAGE 2: Enumerate Clubs")
     print("=" * 60)
 
     # Load Stage 1 checkpoint
@@ -338,159 +328,201 @@ def run_stage2(client: ParallelClient, max_clubs: int = 100, resume: bool = Fals
         print("❌ Stage 1 checkpoint not found. Run --stage 1 first.")
         sys.exit(1)
 
-    # Load existing Stage 2 progress if resuming
-    all_clubs = []
-    completed_unis = set()
+    uni = universities[0]  # Single university in v2
+    uni_name = uni["university"]
+
+    # Check for existing Stage 2 data
     if resume:
         existing = load_checkpoint(STAGE2_FILE)
         if existing:
-            all_clubs = existing
-            completed_unis = {c["university"] for c in existing}
-            print(f"Resuming: {len(completed_unis)} universities already processed")
+            print(f"Resuming: {len(existing)} clubs already found")
+            return existing
 
-    for i, uni in enumerate(universities, 1):
-        uni_name = uni["university"]
-        if uni_name in completed_unis:
-            print(f"\n[{i}/{len(universities)}] SKIP (already done): {uni_name}")
-            continue
+    print(f"\nProcessing: {uni_name}")
 
-        print(f"\n[{i}/{len(universities)}] Processing: {uni_name}")
+    # --- Step A: Search for clubs directory ---
+    search_result = client.search(
+        objective=(
+            f"Find the official student clubs directory or list of "
+            f"student organizations at {uni_name}"
+        ),
+        search_queries=[
+            f"{uni_name} student clubs list",
+            f"{uni_name} student organizations directory",
+            f"{uni_name} student union clubs",
+        ],
+        max_results=5,
+    )
 
-        # --- Step A: Search for clubs directory ---
-        search_result = client.search(
-            objective=f"Find the official student clubs directory or list of student organizations at {uni_name}",
-            search_queries=[
-                f"{uni_name} student clubs list",
-                f"{uni_name} student organizations directory",
-                f"{uni_name} student union clubs",
-            ],
-            max_results=5,
+    # Collect URLs to extract
+    urls_to_extract: list[str] = []
+    if uni.get("clubs_directory_url"):
+        urls_to_extract.append(uni["clubs_directory_url"])
+    for r in search_result.get("results", [])[:3]:
+        url = r.get("url", "")
+        if url and url not in urls_to_extract:
+            urls_to_extract.append(url)
+
+    # --- Step B: Extract content from directory pages ---
+    extracted_content = ""
+    if urls_to_extract:
+        print(f"  Extracting from {len(urls_to_extract)} URL(s)...")
+        extract_result = client.extract(
+            urls=urls_to_extract[:3],
+            objective=f"List of student clubs and organizations at {uni_name}",
+            excerpts=True,
+            full_content=True,
         )
 
-        # Collect URLs to extract from
-        urls_to_extract = []
-        # Prefer the directory URL from Stage 1 if available
-        if uni.get("clubs_directory_url"):
-            urls_to_extract.append(uni["clubs_directory_url"])
-        # Add search result URLs
-        for r in search_result.get("results", [])[:3]:
-            url = r.get("url", "")
-            if url and url not in urls_to_extract:
-                urls_to_extract.append(url)
+        for r in extract_result.get("results", []):
+            content = r.get("full_content") or ""
+            excerpts = r.get("excerpts", [])
+            if content:
+                extracted_content += (
+                    f"\n\n--- From {r.get('url', 'unknown')} ---\n{content}"
+                )
+            elif excerpts:
+                extracted_content += (
+                    f"\n\n--- From {r.get('url', 'unknown')} ---\n"
+                    + "\n".join(excerpts)
+                )
+    else:
+        print("  ⚠ No directory URLs found, using Chat research only")
 
-        if not urls_to_extract:
-            print(f"  ⚠ No directory URLs found for {uni_name}, using Chat research only")
-            # Fall back to Chat with web research
-            extracted_content = ""
-        else:
-            # --- Step B: Extract content from directory pages ---
-            print(f"  Extracting from {len(urls_to_extract)} URL(s)...")
-            extract_result = client.extract(
-                urls=urls_to_extract[:3],  # Max 3 URLs
-                objective=f"List of student clubs and organizations at {uni_name}",
-                excerpts=True,
-                full_content=True,
-            )
-
-            # Combine extracted content
-            extracted_content = ""
-            for r in extract_result.get("results", []):
-                content = r.get("full_content") or ""
-                excerpts = r.get("excerpts", [])
-                if content:
-                    extracted_content += f"\n\n--- From {r.get('url', 'unknown')} ---\n{content}"
-                elif excerpts:
-                    extracted_content += f"\n\n--- From {r.get('url', 'unknown')} ---\n" + "\n".join(excerpts)
-
-        # --- Step C: Parse clubs with Chat ---
-        if extracted_content:
-            prompt = (
-                f"Based on the following extracted content from {uni_name}'s student clubs directory, "
-                f"list up to {max_clubs} student clubs/organizations.\n\n"
-                f"For each club, provide: club name, brief description, website URL (if available), "
-                f"and category (Academic, Cultural, Sports, Professional, Social, Political, Religious, "
-                f"Arts, Technology, Community Service, or Other).\n\n"
-                f"Extracted content:\n{extracted_content[:15000]}"
-            )
-        else:
-            prompt = (
-                f"Research and list up to {max_clubs} student clubs/organizations at {uni_name} in Canada. "
-                f"For each club, provide: club name, brief description, website URL (if available), "
-                f"and category (Academic, Cultural, Sports, Professional, Social, Political, Religious, "
-                f"Arts, Technology, Community Service, or Other).\n\n"
-                f"Focus on active clubs that are likely to have sponsorship needs."
-            )
-
-        parsed, basis = client.chat_json(
-            prompt=prompt,
-            schema=STAGE2_SCHEMA,
-            schema_name="clubs_list",
-            model="base",
-            system_prompt=(
-                "You are a research assistant cataloging student clubs at Canadian universities. "
-                "Only include clubs you have evidence actually exist. Do not fabricate club names."
-            ),
+    # --- Step C: Parse clubs with Chat ---
+    if extracted_content:
+        prompt = (
+            f"Based on the following extracted content from {uni_name}'s "
+            f"student clubs directory, list up to {max_clubs} student "
+            f"clubs/organizations.\n\n"
+            f"For each club, provide: club name, brief description, website "
+            f"URL (if available), and category (Academic, Cultural, Sports, "
+            f"Professional, Social, Political, Religious, Arts, Technology, "
+            f"Community Service, or Other).\n\n"
+            f"Extracted content:\n{extracted_content[:15000]}"
+        )
+    else:
+        prompt = (
+            f"Research and list up to {max_clubs} student "
+            f"clubs/organizations at {uni_name} in Canada. "
+            f"For each club, provide: club name, brief description, "
+            f"website URL (if available), and category.\n\n"
+            f"Focus on active clubs that are likely to have sponsorship needs."
         )
 
-        clubs = parsed.get("clubs", [])[:max_clubs]
+    parsed, basis = client.chat_json(
+        prompt=prompt,
+        schema=STAGE2_SCHEMA,
+        schema_name="clubs_list",
+        model="base",
+        system_prompt=(
+            "You are a research assistant cataloging student clubs at a "
+            "Canadian university. Only include clubs you have evidence "
+            "actually exist. Do not fabricate club names."
+        ),
+    )
 
-        # Extract source URLs from basis
-        source_urls = []
-        for b in basis:
-            if isinstance(b, dict):
-                for key in ("url", "source", "citation"):
-                    if key in b:
-                        source_urls.append(b[key])
+    clubs = parsed.get("clubs", [])[:max_clubs]
 
-        # Annotate each club with university info
-        for club in clubs:
-            club["university"] = uni_name
-            club["province"] = uni.get("province", "")
-            club["source_urls"] = source_urls
+    # Extract source URLs from basis (fixed extraction)
+    source_urls = ParallelClient.extract_source_urls(basis)
 
-        all_clubs.extend(clubs)
-        print(f"  → Found {len(clubs)} clubs at {uni_name}")
+    # Annotate each club with university info
+    for club in clubs:
+        club["university"] = uni_name
+        club["province"] = uni.get("province", "")
+        club["source_urls"] = source_urls
 
-        # Save progress after each university
-        save_checkpoint(all_clubs, STAGE2_FILE)
+    print(f"  → Found {len(clubs)} clubs at {uni_name}")
 
-    print(f"\n{'=' * 40}")
-    print(f"Total clubs found: {len(all_clubs)}")
-    print(f"Total API calls: {client.call_count}")
-    return all_clubs
+    save_checkpoint(clubs, STAGE2_FILE)
+    print(f"\nTotal API calls so far: {client.call_count}")
+    return clubs
 
 
 # =========================================================================
-# STAGE 3: Find Sponsorship Contacts (Batched)
+# STAGE 3: Find Sponsorship Contacts via Task Group API
 # =========================================================================
 
-STAGE3_SCHEMA = {
+# Task spec for contact lookup — flat object, all fields required,
+# nullable via union types for the Task API.
+TASK_INPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "contacts": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "club_name": {"type": "string", "description": "Name of the club (must match input exactly)"},
-                    "contact_name": {"type": "string", "description": "Full name of the contact person"},
-                    "contact_role": {"type": "string", "description": "Their role/title (e.g., Sponsorship Coordinator, VP Finance, President)"},
-                    "contact_email": {"type": "string", "description": "Email address"},
-                    "contact_phone": {"type": "string", "description": "Phone number if available"},
-                    "is_fallback_contact": {"type": "boolean", "description": "True if this is not a sponsorship-specific role"},
-                },
-                "required": ["club_name"],
-            },
-        }
+        "club_name": {
+            "type": "string",
+            "description": "Name of the student club",
+        },
+        "club_website": {
+            "type": "string",
+            "description": "Club website or social media URL (may be empty)",
+        },
+        "university": {
+            "type": "string",
+            "description": "University the club belongs to",
+        },
     },
-    "required": ["contacts"],
+    "required": ["club_name", "club_website", "university"],
+    "additionalProperties": False,
+}
+
+TASK_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "contact_name": {
+            "type": ["string", "null"],
+            "description": (
+                "Full name of the person best suited to handle sponsorship. "
+                "Priority: Sponsorship Coordinator > VP Sponsorship > "
+                "VP Finance/Treasurer > VP External > President. "
+                "Null if not found."
+            ),
+        },
+        "contact_role": {
+            "type": ["string", "null"],
+            "description": "Role/title of the contact person. Null if not found.",
+        },
+        "contact_email": {
+            "type": ["string", "null"],
+            "description": "Email address. Null if not found.",
+        },
+        "contact_phone": {
+            "type": ["string", "null"],
+            "description": "Phone number. Null if not found.",
+        },
+        "is_fallback_contact": {
+            "type": "boolean",
+            "description": (
+                "True if the contact is NOT in a sponsorship-specific role "
+                "(e.g., just the President)."
+            ),
+        },
+    },
+    "required": [
+        "contact_name", "contact_role", "contact_email",
+        "contact_phone", "is_fallback_contact",
+    ],
+    "additionalProperties": False,
+}
+
+TASK_SPEC = {
+    "input_schema": {"json_schema": TASK_INPUT_SCHEMA},
+    "output_schema": {"json_schema": TASK_OUTPUT_SCHEMA},
 }
 
 
-def run_stage3(client: ParallelClient, batch_size: int = 10, resume: bool = False) -> list[dict]:
-    """Find sponsorship contacts for each club using batched Chat lite calls."""
+def run_stage3(
+    client: ParallelClient,
+    resume: bool = False,
+    processor: str = "base-fast",
+) -> list[dict]:
+    """Find sponsorship contacts using Parallel AI Task Group API.
+
+    Creates a Task Group, submits one run per club, polls until complete,
+    then streams all results.
+    """
     print("\n" + "=" * 60)
-    print("STAGE 3: Find Sponsorship Contacts")
+    print("STAGE 3: Find Sponsorship Contacts (Task Group API)")
     print("=" * 60)
 
     # Load Stage 2 checkpoint
@@ -500,95 +532,110 @@ def run_stage3(client: ParallelClient, batch_size: int = 10, resume: bool = Fals
         sys.exit(1)
 
     # Load existing Stage 3 progress if resuming
-    all_contacts = []
-    completed_clubs = set()
     if resume:
         existing = load_checkpoint(STAGE3_FILE)
         if existing:
-            all_contacts = existing
-            completed_clubs = {c["club_name"] for c in existing}
-            print(f"Resuming: {len(completed_clubs)} clubs already processed")
+            completed_names = {c["club_name"] for c in existing}
+            remaining = [c for c in clubs if c["club_name"] not in completed_names]
+            if not remaining:
+                print(f"All {len(existing)} contacts already completed.")
+                return existing
+            print(f"Resuming: {len(existing)} done, {len(remaining)} remaining")
+            clubs = remaining
+        else:
+            existing = []
+    else:
+        existing = []
 
-    # Filter out already-completed clubs
-    remaining_clubs = [c for c in clubs if c["club_name"] not in completed_clubs]
-    print(f"Clubs to process: {len(remaining_clubs)} (of {len(clubs)} total)")
+    print(f"Clubs to process: {len(clubs)}")
+    print(f"Processor: {processor}")
 
-    # Group clubs by university for better batching
-    uni_groups = {}
-    for club in remaining_clubs:
-        uni = club["university"]
-        if uni not in uni_groups:
-            uni_groups[uni] = []
-        uni_groups[uni].append(club)
+    # --- Step A: Create Task Group ---
+    university = clubs[0].get("university", "Unknown")
+    taskgroup_id = client.create_task_group(
+        metadata={"stage": "3_contacts", "university": university}
+    )
 
-    total_batches = 0
-    for uni_name, uni_clubs in uni_groups.items():
-        # Batch within each university
-        for batch_start in range(0, len(uni_clubs), batch_size):
-            batch = uni_clubs[batch_start:batch_start + batch_size]
-            total_batches += 1
+    # --- Step B: Build inputs and submit runs ---
+    inputs = []
+    for club in clubs:
+        inputs.append({
+            "club_name": club.get("club_name", ""),
+            "club_website": club.get("club_website", "") or "",
+            "university": club.get("university", ""),
+        })
 
-            club_list = "\n".join(
-                f"  {j}. {c['club_name']}" + (f" (website: {c.get('club_website', 'N/A')})" if c.get('club_website') else "")
-                for j, c in enumerate(batch, 1)
-            )
+    # Task Group accepts up to 1,000 runs per call
+    all_run_ids: list[str] = []
+    batch_size = 1000
+    for i in range(0, len(inputs), batch_size):
+        batch = inputs[i : i + batch_size]
+        run_ids = client.add_task_runs(
+            taskgroup_id=taskgroup_id,
+            task_spec=TASK_SPEC,
+            inputs=batch,
+            processor=processor,
+        )
+        all_run_ids.extend(run_ids)
 
-            prompt = (
-                f"For each of the following {len(batch)} student clubs at {uni_name} (Canada), "
-                f"find the person best suited to handle sponsorship inquiries.\n\n"
-                f"Search priority for contact role:\n"
-                f"1. Sponsorship Coordinator / Director of Sponsorship\n"
-                f"2. VP Sponsorship\n"
-                f"3. VP Finance / Treasurer\n"
-                f"4. VP External / External Relations\n"
-                f"5. President\n\n"
-                f"For each person found, provide: their full name, role/title, email, and phone number (if available). "
-                f"Set is_fallback_contact to true if the person is NOT in a sponsorship-specific role.\n\n"
-                f"Clubs:\n{club_list}\n\n"
-                f"If you cannot find any contact information for a club, still include it with empty fields."
-            )
+    print(f"\n  Submitted {len(all_run_ids)} task runs to group {taskgroup_id}")
+    print(f"  Estimated cost: ${len(all_run_ids) * 0.01:.2f} (at $10/1K runs)")
 
-            logger.info(f"Stage 3 batch {total_batches}: {uni_name} — {len(batch)} clubs")
+    # --- Step C: Poll until complete ---
+    print("\n  Polling for completion...")
+    status = client.poll_task_group(
+        taskgroup_id=taskgroup_id,
+        poll_interval=5.0,
+        timeout=600.0,
+    )
 
-            parsed, basis = client.chat_json(
-                prompt=prompt,
-                schema=STAGE3_SCHEMA,
-                schema_name="contacts",
-                model="lite",
-                system_prompt=(
-                    "You are a research assistant finding contact information for student club "
-                    "sponsorship outreach. Only provide contact info you actually find — do not "
-                    "fabricate names, emails, or phone numbers. If you cannot find contact info, "
-                    "leave the fields empty."
-                ),
-            )
+    counts = status.get("task_run_status_counts", {})
+    print(f"\n  Final: {counts.get('completed', 0)} completed, "
+          f"{counts.get('failed', 0)} failed")
 
-            contacts = parsed.get("contacts", [])
+    # --- Step D: Stream results ---
+    print("\n  Fetching results...")
+    results = client.get_task_results(taskgroup_id)
 
-            # Extract source URLs from basis
-            source_urls = []
-            for b in basis:
-                if isinstance(b, dict):
-                    for key in ("url", "source", "citation"):
-                        if key in b:
-                            source_urls.append(b[key])
+    # --- Step E: Build contacts list ---
+    contacts: list[dict] = list(existing)  # start with any resumed data
 
-            # Annotate contacts with university info
-            for contact in contacts:
-                contact["university"] = uni_name
-                contact["province"] = uni_clubs[0].get("province", "")
-                contact["source_urls"] = source_urls
+    for res in results:
+        inp = res.get("input", {})
+        output = res.get("output") or {}
+        basis_data = res.get("basis", [])
 
-            all_contacts.extend(contacts)
-            print(f"  Batch {total_batches}: {len(contacts)} contacts from {uni_name}")
+        contact = {
+            "club_name": inp.get("club_name", ""),
+            "university": inp.get("university", ""),
+            "province": "",  # filled from clubs data below
+            "contact_name": output.get("contact_name") or "",
+            "contact_role": output.get("contact_role") or "",
+            "contact_email": output.get("contact_email") or "",
+            "contact_phone": output.get("contact_phone") or "",
+            "is_fallback_contact": output.get("is_fallback_contact", True),
+            "source_urls": ParallelClient.extract_source_urls(basis_data),
+        }
 
-            # Save progress after each batch
-            save_checkpoint(all_contacts, STAGE3_FILE)
+        # Fill province from clubs data
+        for club in clubs:
+            if club.get("club_name") == contact["club_name"]:
+                contact["province"] = club.get("province", "")
+                break
 
+        contacts.append(contact)
+
+    save_checkpoint(contacts, STAGE3_FILE)
+
+    # Stats
+    with_contact = sum(1 for c in contacts if c.get("contact_name"))
+    with_email = sum(1 for c in contacts if c.get("contact_email"))
     print(f"\n{'=' * 40}")
-    print(f"Total contacts found: {len(all_contacts)}")
+    print(f"Total contacts: {len(contacts)}")
+    print(f"  With name:  {with_contact}")
+    print(f"  With email: {with_email}")
     print(f"Total API calls: {client.call_count}")
-    return all_contacts
+    return contacts
 
 
 # =========================================================================
@@ -619,7 +666,9 @@ def normalize_phone(phone: str, region: str = "CA") -> str:
     try:
         parsed = phonenumbers.parse(phone, region)
         if phonenumbers.is_valid_number(parsed):
-            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+            return phonenumbers.format_number(
+                parsed, phonenumbers.PhoneNumberFormat.E164
+            )
     except Exception:
         pass
     return phone.strip()
@@ -627,8 +676,8 @@ def normalize_phone(phone: str, region: str = "CA") -> str:
 
 def deduplicate_clubs(clubs: list[dict], threshold: int = 85) -> list[dict]:
     """Remove duplicate clubs within each university using fuzzy matching."""
-    deduped = []
-    seen = {}  # university -> list of club names
+    deduped: list[dict] = []
+    seen: dict[str, list[str]] = {}
 
     for club in clubs:
         uni = club.get("university", "")
@@ -637,7 +686,6 @@ def deduplicate_clubs(clubs: list[dict], threshold: int = 85) -> list[dict]:
         if uni not in seen:
             seen[uni] = []
 
-        # Check against existing names for this university
         is_dup = False
         for existing_name in seen[uni]:
             if fuzz.token_sort_ratio(name.lower(), existing_name.lower()) >= threshold:
@@ -662,7 +710,6 @@ def run_stage4():
     print("=" * 60)
 
     # Load checkpoints
-    universities = load_checkpoint(STAGE1_FILE) or []
     clubs = load_checkpoint(STAGE2_FILE) or []
     contacts = load_checkpoint(STAGE3_FILE) or []
 
@@ -678,44 +725,51 @@ def run_stage4():
     # --- Step B: Build merged DataFrame ---
     print("\nStep B: Merging clubs with contacts...")
 
-    # Create clubs DataFrame
     clubs_df = pd.DataFrame(clubs)
-    clubs_cols = ["university", "province", "club_name", "club_description",
-                  "club_website", "club_category", "source_urls"]
+    clubs_cols = [
+        "university", "province", "club_name", "club_description",
+        "club_website", "club_category", "source_urls",
+    ]
     for col in clubs_cols:
         if col not in clubs_df.columns:
             clubs_df[col] = ""
 
-    # Create contacts DataFrame
     if contacts:
         contacts_df = pd.DataFrame(contacts)
-        contacts_cols = ["club_name", "university", "contact_name", "contact_role",
-                         "contact_email", "contact_phone", "is_fallback_contact", "source_urls"]
+        contacts_cols = [
+            "club_name", "university", "contact_name", "contact_role",
+            "contact_email", "contact_phone", "is_fallback_contact",
+            "source_urls",
+        ]
         for col in contacts_cols:
             if col not in contacts_df.columns:
                 contacts_df[col] = ""
 
         # Merge on club_name + university
         merged = clubs_df.merge(
-            contacts_df[["club_name", "university", "contact_name", "contact_role",
-                          "contact_email", "contact_phone", "is_fallback_contact"]],
+            contacts_df[[
+                "club_name", "university", "contact_name", "contact_role",
+                "contact_email", "contact_phone", "is_fallback_contact",
+            ]],
             on=["club_name", "university"],
             how="left",
             suffixes=("", "_contact"),
         )
     else:
         merged = clubs_df.copy()
-        for col in ["contact_name", "contact_role", "contact_email", "contact_phone", "is_fallback_contact"]:
+        for col in [
+            "contact_name", "contact_role", "contact_email",
+            "contact_phone", "is_fallback_contact",
+        ]:
             merged[col] = ""
 
     # --- Step C: Validate emails ---
     print("\nStep C: Validating emails...")
     merged["email_format_valid"] = merged["contact_email"].apply(validate_email)
 
-    # MX record check (only for valid-format emails)
     print("  Checking MX records for email domains...")
-    mx_cache = {}
-    domain_valid_list = []
+    mx_cache: dict[str, bool] = {}
+    domain_valid_list: list[bool] = []
     for email in merged["contact_email"]:
         if not validate_email(email):
             domain_valid_list.append(False)
@@ -726,8 +780,8 @@ def run_stage4():
         domain_valid_list.append(mx_cache[domain])
 
     merged["email_domain_valid"] = domain_valid_list
-    valid_emails = merged["email_format_valid"].sum()
-    valid_domains = merged["email_domain_valid"].sum()
+    valid_emails = int(merged["email_format_valid"].sum())
+    valid_domains = int(merged["email_domain_valid"].sum())
     print(f"  {valid_emails} valid-format emails, {valid_domains} with valid MX records")
 
     # --- Step D: Normalize phone numbers ---
@@ -751,7 +805,7 @@ def run_stage4():
     merged["data_quality"] = merged.apply(score_quality, axis=1)
 
     quality_counts = merged["data_quality"].value_counts()
-    print(f"  Data quality distribution:")
+    print("  Data quality distribution:")
     for q, c in quality_counts.items():
         print(f"    {q}: {c}")
 
@@ -765,16 +819,14 @@ def run_stage4():
 
     # --- Step G: Select and order final columns ---
     final_columns = [
-        "university", "province", "club_name", "club_description", "club_website",
-        "club_category", "contact_name", "contact_role", "contact_email",
-        "contact_phone", "is_fallback_contact", "email_format_valid",
-        "email_domain_valid", "data_quality", "source_url",
+        "university", "province", "club_name", "club_description",
+        "club_website", "club_category", "contact_name", "contact_role",
+        "contact_email", "contact_phone", "is_fallback_contact",
+        "email_format_valid", "email_domain_valid", "data_quality",
+        "source_url",
     ]
-    # Only include columns that exist
     final_columns = [c for c in final_columns if c in merged.columns]
     output_df = merged[final_columns].copy()
-
-    # Fill NaN
     output_df = output_df.fillna("")
 
     # --- Step H: Export ---
@@ -789,7 +841,7 @@ def run_stage4():
     print(f"Total clubs: {len(output_df)}")
     print(f"Clubs with contacts: {(output_df['contact_name'] != '').sum()}")
     print(f"Clubs with valid emails: {valid_emails}")
-    print(f"Quality breakdown:")
+    print("Quality breakdown:")
     for q, c in quality_counts.items():
         print(f"  {q}: {c}")
 
@@ -800,14 +852,41 @@ def run_stage4():
 # CLI
 # =========================================================================
 
+DEFAULT_UNIVERSITY = "University of British Columbia"
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Canadian Club Sponsorship Lead List Builder")
-    parser.add_argument("--test", action="store_true", help="Run smoke test (Phase 0)")
-    parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], help="Run a specific stage")
-    parser.add_argument("--all", action="store_true", help="Run all stages 1-4")
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
-    parser.add_argument("--max-clubs", type=int, default=100, help="Max clubs per university (default 100)")
-    parser.add_argument("--batch-size", type=int, default=10, help="Clubs per Chat batch in Stage 3 (default 10)")
+    parser = argparse.ArgumentParser(
+        description="Canadian Club Sponsorship Lead List Builder (v2)"
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Run smoke test (Phase 0)",
+    )
+    parser.add_argument(
+        "--stage", type=int, choices=[1, 2, 3, 4],
+        help="Run a specific stage",
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Run all stages 1-4",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from checkpoint",
+    )
+    parser.add_argument(
+        "--university", type=str, default=DEFAULT_UNIVERSITY,
+        help=f"Target university (default: {DEFAULT_UNIVERSITY})",
+    )
+    parser.add_argument(
+        "--max-clubs", type=int, default=100,
+        help="Max clubs to enumerate (default 100)",
+    )
+    parser.add_argument(
+        "--processor", type=str, default="base-fast",
+        help="Task processor for Stage 3 (default: base-fast)",
+    )
     args = parser.parse_args()
 
     if not any([args.test, args.stage, args.all]):
@@ -820,7 +899,7 @@ def main():
         success = run_smoke_test(client)
         sys.exit(0 if success else 1)
 
-    stages_to_run = []
+    stages_to_run: list[int] = []
     if args.all:
         stages_to_run = [1, 2, 3, 4]
     elif args.stage:
@@ -828,11 +907,11 @@ def main():
 
     for stage in stages_to_run:
         if stage == 1:
-            run_stage1(client)
+            run_stage1(client, university=args.university)
         elif stage == 2:
             run_stage2(client, max_clubs=args.max_clubs, resume=args.resume)
         elif stage == 3:
-            run_stage3(client, batch_size=args.batch_size, resume=args.resume)
+            run_stage3(client, resume=args.resume, processor=args.processor)
         elif stage == 4:
             run_stage4()
 

@@ -1,7 +1,14 @@
-# Plan: Canadian Club Sponsorship Lead List via Parallel AI
+# Plan: Canadian Club Sponsorship Lead List via Parallel AI (v2)
 
 ## Objective
-Build a Python pipeline to identify the top 10 Canadian universities with 25+ student clubs, enumerate up to 100 clubs per school, and find sponsorship contacts — exporting to CSV.
+Build a Python pipeline to enumerate student clubs at a target Canadian university and find sponsorship contacts — exporting to CSV. Default target: **University of British Columbia**.
+
+## v2 Changes (from v1)
+- **Narrowed scope**: Single university at a time (via `--university` flag) instead of 10
+- **Task Group API**: Stage 3 now uses Parallel AI's Task Group API for concurrent contact lookups (up to 2,000 runs/min) instead of sequential Chat `lite` batches
+- **Better model**: `base-fast` processor ($10/1K runs, ~5 output fields) replaces `lite` ($5/1K) for higher quality
+- **Fixed basis extraction**: Source URLs now correctly walk `basis[].citations[].url` nested structure
+- **1 run per club**: Eliminates generic fallback email contamination from batching
 
 ## API Configuration
 - **API Key**: Set via `PARALLEL_API_KEY` env var (see `.env.example`)
@@ -12,58 +19,65 @@ Build a Python pipeline to identify the top 10 Canadian universities with 25+ st
 ## Endpoints Used
 | Endpoint | Method | Use |
 |---|---|---|
-| `/v1beta/search` | POST | Find university club directories, club pages |
-| `/v1beta/extract` | POST | Pull content from specific URLs |
-| `/v1beta/chat/completions` | POST | Structure data with `json_schema` response format |
+| `/v1beta/search` | POST | Find university club directories |
+| `/v1beta/extract` | POST | Pull content from directory URLs |
+| `/v1beta/chat/completions` | POST | Parse club lists (Stage 2) |
+| `/v1beta/tasks/groups` | POST | Create Task Group (Stage 3) |
+| `/v1beta/tasks/groups/{id}/runs` | POST | Add task runs |
+| `/v1beta/tasks/groups/{id}` | GET | Poll group status |
+| `/v1beta/tasks/groups/{id}/runs?include_input=true&include_output=true` | GET (SSE) | Stream results |
 
-## Models
-| Model | Web Research? | Used In | Cost/call |
+## Models / Processors
+| Model/Processor | Web Research? | Used In | Cost |
 |---|---|---|---|
-| `base` | Yes | Stage 1 (universities), Stage 2 (club parsing) | $0.01 |
-| `lite` | Yes | Stage 3 (contact lookups, batched) | $0.005 |
+| `base` (Chat) | Yes | Stage 1 (directory), Stage 2 (club parsing) | $10/1K calls |
+| `base-fast` (Task) | Yes | Stage 3 (contact lookups, concurrent) | $10/1K runs |
 
 ## Pipeline Stages
 
 ### Phase 0: Smoke Test (`--test`)
 - 1 Search call + 1 Chat call to verify API key & response formats
-- Must pass before proceeding
 
-### Stage 1: Identify Universities (~3 Chat `base` calls)
-- Ask Chat `base` for top 15 Canadian universities by club count
-- Filter to top 10 with 25+ clubs
+### Stage 1: Resolve Directory URL (~0-2 calls)
+- If university is in `KNOWN_DIRECTORIES` dict → 0 API calls
+- Otherwise: Search + Chat `base` to find the clubs directory URL
 - Output: `checkpoints/stage1_universities.json`
-- Schema: `{university, province, est_club_count, clubs_directory_url, source_urls}`
 
-### Stage 2: Enumerate Clubs (~30-40 calls)
-- Per university: Search → Extract → Chat `base`
-- Parse up to 100 clubs per school from directory content
+### Stage 2: Enumerate Clubs (~3-4 calls)
+- Search → Extract → Chat `base`
+- Parse up to 100 clubs from directory content
 - Output: `checkpoints/stage2_clubs.json`
-- Schema: `{university, province, club_name, club_description, club_website, club_category}`
 
-### Stage 3: Find Contacts (~100 Chat `lite` calls)
-- Batch 10 clubs per Chat `lite` call
+### Stage 3: Find Contacts via Task Group (~100 task runs)
+- Create Task Group → submit 1 run per club (`base-fast`) → poll → stream results
+- Each run independently researches one club's sponsorship contact
 - Priority: Sponsorship Coordinator → VP Sponsorship → VP Finance → VP External → President
 - Output: `checkpoints/stage3_contacts.json`
-- Schema: `{club_name, contact_name, contact_role, contact_email, contact_phone, is_fallback_contact}`
+- Task spec uses flat object schema with `["string", "null"]` union types, `additionalProperties: false`
 
-### Stage 4: Validate & Export CSV (pure Python/pandas)
+### Stage 4: Validate & Export CSV (pure Python/pandas, no API calls)
 - Fuzzy dedup via `thefuzz` (threshold 85)
-- Email regex validation + DNS MX lookup
+- Email regex + DNS MX validation
 - Phone normalization via `phonenumbers`
-- Data quality scoring (high/medium/low)
-- Source URL propagation from `basis` citations
+- Data quality scoring (high/medium/low/no_contact)
+- Source URL propagation from `basis[].citations[].url`
 - Output: `sponsorship_leads.csv`
 
-## Estimated Budget: ~140 calls, ~$0.73
+## Estimated Cost (100 clubs at UBC)
+| Stage | Calls/Runs | Cost |
+|---|---|---|
+| Stage 1 | 0 (known URL) | $0.00 |
+| Stage 2 | ~4 (Search + Extract + Chat) | ~$0.03 |
+| Stage 3 | 100 task runs | $1.00 |
+| Stage 4 | 0 | $0.00 |
+| **Total** | **~104** | **~$1.03** |
 
 ## CLI Usage
 ```bash
-python lead_scraper.py --test          # Phase 0: smoke test
-python lead_scraper.py --stage 1       # Run stage 1 only
-python lead_scraper.py --stage 2       # Run stage 2 only
-python lead_scraper.py --stage 3       # Run stage 3 only
-python lead_scraper.py --stage 4       # Run stage 4 only
-python lead_scraper.py --all           # Run stages 1-4
-python lead_scraper.py --stage 2 --resume  # Resume stage 2 from checkpoint
-python lead_scraper.py --max-clubs 50  # Cap clubs per school
+python lead_scraper.py --test                                   # Smoke test
+python lead_scraper.py --all                                    # All stages (UBC default)
+python lead_scraper.py --all --university "McGill University"    # Different university
+python lead_scraper.py --stage 3 --resume                       # Resume Stage 3
+python lead_scraper.py --max-clubs 50 --all                     # Cap at 50 clubs
+python lead_scraper.py --all --processor lite-fast              # Use cheaper processor
 ```

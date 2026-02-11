@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import requests
 from dotenv import load_dotenv
@@ -327,6 +327,230 @@ class ParallelClient:
 
         basis = result.get("basis", [])
         return parsed, basis
+
+    @staticmethod
+    def extract_source_urls(basis: list) -> list[str]:
+        """Extract source URLs from basis citations.
+
+        The Chat API returns basis as:
+            [{"field": "...", "citations": [{"url": "...", ...}], ...}]
+        The Task API returns output.basis in the same nested format.
+        """
+        urls = []
+        for entry in basis:
+            if not isinstance(entry, dict):
+                continue
+            # Nested citations (standard format)
+            for cit in entry.get("citations", []):
+                if isinstance(cit, dict) and cit.get("url"):
+                    urls.append(cit["url"])
+            # Flat fallback (some older responses)
+            for key in ("url", "source"):
+                if key in entry and entry[key]:
+                    urls.append(entry[key])
+        # Deduplicate while preserving order
+        seen = set()
+        deduped = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
+        return deduped
+
+    # ------------------------------------------------------------------
+    # Task Group API
+    # ------------------------------------------------------------------
+
+    def _headers_task(self) -> dict:
+        """Headers for Task / Task Group endpoints."""
+        return {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+        }
+
+    def create_task_group(self, metadata: Optional[dict] = None) -> str:
+        """Create a Task Group and return its taskgroup_id."""
+        url = f"{self.base_url}/v1beta/tasks/groups"
+        payload: dict[str, Any] = {}
+        if metadata:
+            payload["metadata"] = metadata
+
+        logger.info("TASK GROUP: Creating...")
+        result = self._request("POST", url, self._headers_task(), payload)
+        tg_id = result["taskgroup_id"]
+        logger.info(f"  → Task Group created: {tg_id}")
+        return tg_id
+
+    def add_task_runs(
+        self,
+        taskgroup_id: str,
+        task_spec: dict,
+        inputs: list[dict],
+        processor: str = "base-fast",
+    ) -> list[str]:
+        """Add task runs to a Task Group.
+
+        Args:
+            taskgroup_id: The Task Group ID.
+            task_spec: Task spec with input_schema and output_schema.
+            inputs: List of input dicts matching input_schema.
+            processor: Processor tier ('lite', 'base-fast', 'core', etc.).
+
+        Returns:
+            List of run_id strings.
+        """
+        url = f"{self.base_url}/v1beta/tasks/groups/{taskgroup_id}/runs"
+
+        # Build run inputs
+        run_inputs = [
+            {"input": inp, "processor": processor}
+            for inp in inputs
+        ]
+
+        payload = {
+            "default_task_spec": task_spec,
+            "inputs": run_inputs,
+        }
+
+        logger.info(f"TASK GROUP ADD: {len(run_inputs)} runs (processor={processor})")
+        result = self._request("POST", url, self._headers_task(), payload)
+        run_ids = result.get("run_ids", [])
+        status = result.get("status", {})
+        logger.info(
+            f"  → {len(run_ids)} runs queued. "
+            f"Total in group: {status.get('num_task_runs', '?')}"
+        )
+        return run_ids
+
+    def poll_task_group(
+        self,
+        taskgroup_id: str,
+        poll_interval: float = 5.0,
+        timeout: float = 600.0,
+    ) -> dict:
+        """Poll a Task Group until all runs complete.
+
+        Returns:
+            Final status dict with num_task_runs, task_run_status_counts, etc.
+        """
+        url = f"{self.base_url}/v1beta/tasks/groups/{taskgroup_id}"
+        headers = self._headers_task()
+        start = time.time()
+
+        while True:
+            elapsed = time.time() - start
+            if elapsed > timeout:
+                raise TimeoutError(
+                    f"Task Group {taskgroup_id} did not complete within {timeout}s"
+                )
+
+            resp = requests.get(url, headers=headers, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status", {})
+
+            counts = status.get("task_run_status_counts", {})
+            total = status.get("num_task_runs", 0)
+            completed = counts.get("completed", 0)
+            failed = counts.get("failed", 0)
+            running = counts.get("running", 0)
+            queued = counts.get("queued", 0)
+
+            logger.info(
+                f"  Poll [{elapsed:.0f}s]: "
+                f"{completed}/{total} completed, "
+                f"{running} running, {queued} queued, {failed} failed"
+            )
+            print(
+                f"  ⏳ {completed}/{total} done "
+                f"({running} running, {queued} queued, {failed} failed) "
+                f"[{elapsed:.0f}s]",
+                end="\r",
+            )
+
+            if not status.get("is_active", True):
+                print()  # newline after \r
+                logger.info(
+                    f"  Task Group complete: {completed} completed, {failed} failed"
+                )
+                return status
+
+            time.sleep(poll_interval)
+
+    def get_task_results(
+        self,
+        taskgroup_id: str,
+    ) -> list[dict]:
+        """Fetch all task run results from a completed Task Group via SSE stream.
+
+        Returns:
+            List of dicts with keys: run_id, status, input, output, basis.
+        """
+        url = (
+            f"{self.base_url}/v1beta/tasks/groups/{taskgroup_id}/runs"
+            f"?include_input=true&include_output=true"
+        )
+        headers = self._headers_task()
+        headers["Accept"] = "text/event-stream"
+
+        logger.info(f"TASK GROUP RESULTS: Streaming from {taskgroup_id}")
+
+        resp = requests.get(url, headers=headers, timeout=300, stream=True)
+        resp.raise_for_status()
+
+        results = []
+        buffer = ""
+
+        for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
+            buffer += chunk
+            # SSE events are separated by double newlines
+            while "\n\n" in buffer:
+                event_text, buffer = buffer.split("\n\n", 1)
+                # Parse SSE fields
+                data_lines = []
+                for line in event_text.strip().split("\n"):
+                    if line.startswith("data: "):
+                        data_lines.append(line[6:])
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:])
+                if not data_lines:
+                    continue
+                raw = "\n".join(data_lines)
+                if raw == "[DONE]":
+                    break
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning(f"  Skipping unparseable SSE data: {raw[:200]}")
+                    continue
+
+                if event.get("type") == "task_run.state":
+                    run_data = {
+                        "run_id": event.get("run_id", ""),
+                        "status": event.get("status", ""),
+                        "input": event.get("input", {}).get("input", {})
+                            if event.get("input") else {},
+                        "output": None,
+                        "basis": [],
+                    }
+                    output = event.get("output")
+                    if output and isinstance(output, dict):
+                        run_data["output"] = output.get("content", {})
+                        run_data["basis"] = output.get("basis", [])
+                    results.append(run_data)
+
+        logger.info(f"  → {len(results)} results fetched")
+        return results
+
+    def get_run_result(self, run_id: str) -> dict:
+        """Get the result of a single task run (blocks until complete)."""
+        url = f"{self.base_url}/v1/tasks/runs/{run_id}/result"
+        headers = self._headers_task()
+
+        logger.info(f"TASK RUN RESULT: {run_id}")
+        resp = requests.get(url, headers=headers, timeout=600)
+        resp.raise_for_status()
+        return resp.json()
 
     @property
     def call_count(self) -> int:
