@@ -61,8 +61,8 @@ if not logger.handlers:
 # Well-known club directory URLs (saves an API call when available)
 # ---------------------------------------------------------------------------
 KNOWN_DIRECTORIES: dict[str, str] = {
-    "University of British Columbia": "https://amscampusbase.ubc.ca/club_signup",
-    "University of Toronto": "https://www.ulife.utoronto.ca/organizations",
+    "University of British Columbia": "https://amsclubs.ca/all-clubs/",
+    "University of Toronto": "https://sop.utoronto.ca/groups/",
     "McGill University": "https://involvement.mcgill.ca/club-search",
     "University of Alberta": "https://campusconnect.ualberta.ca/organizations",
     "McMaster University": "https://msumcmaster.ca/clubs/",
@@ -316,8 +316,15 @@ def run_stage2(
     client: ParallelClient,
     max_clubs: int = 100,
     resume: bool = False,
+    timeout: float = 45.0,
 ) -> list[dict]:
-    """Enumerate up to max_clubs at the target university."""
+    """Enumerate up to max_clubs at the target university.
+
+    Args:
+        timeout: Wallclock limit in seconds for the Search → Extract → Chat
+                 sequence.  If exceeded between steps and at least 2 clubs
+                 have already been found, remaining steps are skipped.
+    """
     print("\n" + "=" * 60)
     print("STAGE 2: Enumerate Clubs")
     print("=" * 60)
@@ -339,6 +346,10 @@ def run_stage2(
             return existing
 
     print(f"\nProcessing: {uni_name}")
+    stage2_start = time.time()
+
+    def _remaining() -> float:
+        return max(0.0, timeout - (time.time() - stage2_start))
 
     # --- Step A: Search for clubs directory ---
     search_result = client.search(
@@ -365,27 +376,33 @@ def run_stage2(
 
     # --- Step B: Extract content from directory pages ---
     extracted_content = ""
-    if urls_to_extract:
+    if _remaining() <= 0:
+        print(f"  ⚠ Timeout ({timeout}s) reached after Search — skipping Extract")
+    elif urls_to_extract:
         print(f"  Extracting from {len(urls_to_extract)} URL(s)...")
-        extract_result = client.extract(
-            urls=urls_to_extract[:3],
-            objective=f"List of student clubs and organizations at {uni_name}",
-            excerpts=True,
-            full_content=True,
-        )
+        try:
+            extract_result = client.extract(
+                urls=urls_to_extract[:3],
+                objective=f"List of student clubs and organizations at {uni_name}",
+                excerpts=True,
+                full_content=True,
+            )
 
-        for r in extract_result.get("results", []):
-            content = r.get("full_content") or ""
-            excerpts = r.get("excerpts", [])
-            if content:
-                extracted_content += (
-                    f"\n\n--- From {r.get('url', 'unknown')} ---\n{content}"
-                )
-            elif excerpts:
-                extracted_content += (
-                    f"\n\n--- From {r.get('url', 'unknown')} ---\n"
-                    + "\n".join(excerpts)
-                )
+            for r in extract_result.get("results", []):
+                content = r.get("full_content") or ""
+                excerpts = r.get("excerpts", [])
+                if content:
+                    extracted_content += (
+                        f"\n\n--- From {r.get('url', 'unknown')} ---\n{content}"
+                    )
+                elif excerpts:
+                    extracted_content += (
+                        f"\n\n--- From {r.get('url', 'unknown')} ---\n"
+                        + "\n".join(excerpts)
+                    )
+        except Exception as e:
+            logger.warning(f"  Extract failed: {e}")
+            print(f"  ⚠ Extract failed ({e}), falling back to Chat-only")
     else:
         print("  ⚠ No directory URLs found, using Chat research only")
 
@@ -422,6 +439,9 @@ def run_stage2(
         ),
     )
 
+    elapsed = time.time() - stage2_start
+    print(f"  Stage 2 completed in {elapsed:.1f}s (limit: {timeout}s)")
+
     clubs = parsed.get("clubs", [])[:max_clubs]
 
     # Extract source URLs from basis (fixed extraction)
@@ -432,6 +452,141 @@ def run_stage2(
         club["university"] = uni_name
         club["province"] = uni.get("province", "")
         club["source_urls"] = source_urls
+
+    print(f"  → Found {len(clubs)} clubs at {uni_name}")
+
+    save_checkpoint(clubs, STAGE2_FILE)
+    print(f"\nTotal API calls so far: {client.call_count}")
+    return clubs
+
+
+# =========================================================================
+# STAGE 2 (FindAll): Discover Clubs via FindAll API
+# =========================================================================
+
+def run_stage2_findall(
+    client: ParallelClient,
+    max_clubs: int = 100,
+    resume: bool = False,
+) -> list[dict]:
+    """Discover clubs at the target university using the FindAll API.
+
+    FindAll handles candidate generation, validation, and (optionally)
+    enrichment in a single async run.  More expensive than the
+    Search→Extract→Chat pipeline ($0.25 + $0.03/match) but tends to
+    find more clubs with built-in citation backing.
+    """
+    print("\n" + "=" * 60)
+    print("STAGE 2: Enumerate Clubs (FindAll API)")
+    print("=" * 60)
+
+    # Load Stage 1 checkpoint
+    universities = load_checkpoint(STAGE1_FILE)
+    if not universities:
+        print("❌ Stage 1 checkpoint not found. Run --stage 1 first.")
+        sys.exit(1)
+
+    uni = universities[0]
+    uni_name = uni["university"]
+
+    if resume:
+        existing = load_checkpoint(STAGE2_FILE)
+        if existing:
+            print(f"Resuming: {len(existing)} clubs already found")
+            return existing
+
+    print(f"\nProcessing: {uni_name}")
+
+    # --- Step A: Ingest – let the API decompose our objective ---
+    objective = (
+        f"FindAll active student clubs and organizations at "
+        f"{uni_name} in Canada"
+    )
+    print(f"  Ingesting objective...")
+    schema = client.findall_ingest(objective)
+
+    entity_type = schema.get("entity_type", "student clubs")
+    match_conditions = schema.get("match_conditions", [])
+
+    # Ensure we always have a university-scoped condition
+    uni_condition_present = any(
+        uni_name.lower() in mc.get("description", "").lower()
+        for mc in match_conditions
+    )
+    if not uni_condition_present:
+        match_conditions.append({
+            "name": "belongs_to_university_check",
+            "description": (
+                f"The club/organization must be officially affiliated with "
+                f"or registered at {uni_name}."
+            ),
+        })
+
+    print(f"  Entity type: {entity_type}")
+    print(f"  Match conditions ({len(match_conditions)}):")
+    for mc in match_conditions:
+        print(f"    • {mc['name']}: {mc['description'][:80]}")
+
+    # --- Step B: Create FindAll run ---
+    match_limit = max(5, min(max_clubs, 1000))
+    estimated_cost = 0.25 + 0.03 * match_limit
+    print(f"\n  Creating FindAll run (base, limit={match_limit})...")
+    print(f"  Estimated max cost: ${estimated_cost:.2f}")
+
+    findall_id = client.findall_create_run(
+        objective=objective,
+        entity_type=entity_type,
+        match_conditions=match_conditions,
+        generator="base",
+        match_limit=match_limit,
+        metadata={"stage": "2_clubs_findall", "university": uni_name},
+    )
+
+    # --- Step C: Poll until complete ---
+    print("\n  Polling for completion...")
+    status = client.poll_findall_run(
+        findall_id=findall_id,
+        poll_interval=5.0,
+        timeout=300.0,
+    )
+
+    timed_out = status.get("timed_out", False)
+    metrics = status.get("metrics", {})
+    generated = metrics.get("generated_candidates_count", 0)
+    matched = metrics.get("matched_candidates_count", 0)
+
+    if timed_out:
+        print(f"\n  ⚠ Timed out — collecting {matched} partial matches "
+              f"({generated} generated)")
+    else:
+        print(f"\n  Complete: {matched} matched ({generated} generated)")
+
+    # --- Step D: Fetch matched candidates ---
+    print("\n  Fetching results...")
+    candidates = client.get_findall_results(findall_id)
+
+    # --- Step E: Convert to our club dict format ---
+    clubs: list[dict] = []
+    for cand in candidates[:max_clubs]:
+        # Extract source URLs from basis
+        source_urls = []
+        for b in cand.get("basis", []):
+            for cit in b.get("citations", []):
+                url = cit.get("url", "")
+                if url and url not in source_urls:
+                    source_urls.append(url)
+
+        # Try to infer category from description
+        club = {
+            "club_name": cand.get("name", ""),
+            "club_description": cand.get("description", ""),
+            "club_website": cand.get("url", ""),
+            "club_category": "",  # may be enriched later
+            "university": uni_name,
+            "province": uni.get("province", ""),
+            "source_urls": source_urls,
+        }
+        clubs.append(club)
 
     print(f"  → Found {len(clubs)} clubs at {uni_name}")
 
@@ -589,11 +744,18 @@ def run_stage3(
         timeout=600.0,
     )
 
+    timed_out = status.get("timed_out", False)
     counts = status.get("task_run_status_counts", {})
-    print(f"\n  Final: {counts.get('completed', 0)} completed, "
-          f"{counts.get('failed', 0)} failed")
+    completed_count = counts.get("completed", 0)
+    failed_count = counts.get("failed", 0)
 
-    # --- Step D: Stream results ---
+    if timed_out:
+        print(f"\n  ⚠ Timed out — collecting {completed_count} partial results "
+              f"({failed_count} failed)")
+    else:
+        print(f"\n  Final: {completed_count} completed, {failed_count} failed")
+
+    # --- Step D: Stream results (works for both complete & partial) ---
     print("\n  Fetching results...")
     results = client.get_task_results(taskgroup_id)
 
@@ -884,6 +1046,14 @@ def main():
         help="Max clubs to enumerate (default 100)",
     )
     parser.add_argument(
+        "--stage2-timeout", type=float, default=45.0,
+        help="Wallclock limit in seconds for Stage 2 (default 45)",
+    )
+    parser.add_argument(
+        "--findall", action="store_true",
+        help="Use FindAll API for Stage 2 club discovery",
+    )
+    parser.add_argument(
         "--processor", type=str, default="base-fast",
         help="Task processor for Stage 3 (default: base-fast)",
     )
@@ -909,7 +1079,19 @@ def main():
         if stage == 1:
             run_stage1(client, university=args.university)
         elif stage == 2:
-            run_stage2(client, max_clubs=args.max_clubs, resume=args.resume)
+            if args.findall:
+                run_stage2_findall(
+                    client,
+                    max_clubs=args.max_clubs,
+                    resume=args.resume,
+                )
+            else:
+                run_stage2(
+                    client,
+                    max_clubs=args.max_clubs,
+                    resume=args.resume,
+                    timeout=args.stage2_timeout,
+                )
         elif stage == 3:
             run_stage3(client, resume=args.resume, processor=args.processor)
         elif stage == 4:

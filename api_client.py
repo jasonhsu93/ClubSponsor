@@ -432,17 +432,24 @@ class ParallelClient:
 
         Returns:
             Final status dict with num_task_runs, task_run_status_counts, etc.
+            If the timeout is reached, the dict includes ``"timed_out": True``
+            so callers can handle partial results gracefully.
         """
         url = f"{self.base_url}/v1beta/tasks/groups/{taskgroup_id}"
         headers = self._headers_task()
         start = time.time()
+        status: dict = {}  # initialise in case timeout fires on first iteration
 
         while True:
             elapsed = time.time() - start
             if elapsed > timeout:
-                raise TimeoutError(
-                    f"Task Group {taskgroup_id} did not complete within {timeout}s"
+                print()  # newline after \r
+                logger.warning(
+                    f"  Task Group {taskgroup_id} timed out after {timeout}s "
+                    f"— returning partial results"
                 )
+                status["timed_out"] = True
+                return status
 
             resp = requests.get(url, headers=headers, timeout=60)
             resp.raise_for_status()
@@ -551,6 +558,191 @@ class ParallelClient:
         resp = requests.get(url, headers=headers, timeout=600)
         resp.raise_for_status()
         return resp.json()
+
+    # ------------------------------------------------------------------
+    # FindAll API
+    # ------------------------------------------------------------------
+
+    FINDALL_BETA_HEADER = "findall-2025-09-15"
+
+    def _headers_findall(self) -> dict:
+        """Headers for FindAll endpoints."""
+        return {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "parallel-beta": self.FINDALL_BETA_HEADER,
+        }
+
+    def findall_ingest(self, objective: str) -> dict:
+        """Convert a natural-language objective into a structured FindAll schema.
+
+        Returns:
+            Dict with keys: objective, entity_type, match_conditions.
+        """
+        url = f"{self.base_url}/v1beta/findall/ingest"
+        payload = {"objective": objective}
+
+        logger.info(f"FINDALL INGEST: {objective[:80]}...")
+        result = self._request("POST", url, self._headers_findall(), payload)
+        logger.info(
+            f"  → entity_type={result.get('entity_type')}, "
+            f"{len(result.get('match_conditions', []))} match conditions"
+        )
+        return result
+
+    def findall_create_run(
+        self,
+        objective: str,
+        entity_type: str,
+        match_conditions: list[dict],
+        generator: str = "base",
+        match_limit: int = 100,
+        exclude_list: Optional[list[dict]] = None,
+        metadata: Optional[dict] = None,
+    ) -> str:
+        """Start a FindAll run and return the findall_id.
+
+        Args:
+            objective: Natural-language description.
+            entity_type: e.g. "student clubs".
+            match_conditions: List of {name, description} dicts.
+            generator: 'preview', 'base', 'core', or 'pro'.
+            match_limit: Max matched candidates (5–1000).
+            exclude_list: Optional [{name, url}, ...] to skip.
+            metadata: Optional metadata dict.
+
+        Returns:
+            findall_id string.
+        """
+        url = f"{self.base_url}/v1beta/findall/runs"
+        payload: dict[str, Any] = {
+            "objective": objective,
+            "entity_type": entity_type,
+            "match_conditions": match_conditions,
+            "generator": generator,
+            "match_limit": max(5, min(match_limit, 1000)),
+        }
+        if exclude_list:
+            payload["exclude_list"] = exclude_list
+        if metadata:
+            payload["metadata"] = metadata
+
+        logger.info(
+            f"FINDALL RUN: generator={generator}, limit={match_limit} "
+            f"— {objective[:60]}..."
+        )
+        result = self._request("POST", url, self._headers_findall(), payload)
+        fid = result["findall_id"]
+        logger.info(f"  → FindAll run created: {fid}")
+        return fid
+
+    def poll_findall_run(
+        self,
+        findall_id: str,
+        poll_interval: float = 5.0,
+        timeout: float = 300.0,
+    ) -> dict:
+        """Poll a FindAll run until it completes.
+
+        Returns:
+            Run status dict.  Includes ``"timed_out": True`` if the timeout
+            is reached before the run finishes.
+        """
+        url = f"{self.base_url}/v1beta/findall/runs/{findall_id}"
+        headers = self._headers_findall()
+        start = time.time()
+        status: dict = {}
+
+        while True:
+            elapsed = time.time() - start
+            if elapsed > timeout:
+                print()
+                logger.warning(
+                    f"  FindAll {findall_id} timed out after {timeout}s"
+                )
+                status["timed_out"] = True
+                return status
+
+            resp = requests.get(url, headers=headers, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status", {})
+            metrics = status.get("metrics", {})
+            generated = metrics.get("generated_candidates_count", 0)
+            matched = metrics.get("matched_candidates_count", 0)
+
+            logger.info(
+                f"  Poll [{elapsed:.0f}s]: "
+                f"{generated} generated, {matched} matched"
+            )
+            print(
+                f"  ⏳ {matched} matched ({generated} generated) [{elapsed:.0f}s]",
+                end="\r",
+            )
+
+            if not status.get("is_active", True):
+                print()
+                logger.info(
+                    f"  FindAll complete: {generated} generated, {matched} matched"
+                )
+                return status
+
+            time.sleep(poll_interval)
+
+    def get_findall_results(self, findall_id: str) -> list[dict]:
+        """Fetch matched candidates from a completed FindAll run.
+
+        Returns:
+            List of candidate dicts (name, url, description, output, basis, ...).
+        """
+        url = f"{self.base_url}/v1beta/findall/runs/{findall_id}/result"
+        headers = self._headers_findall()
+
+        logger.info(f"FINDALL RESULTS: {findall_id}")
+
+        self._rate_limit()
+        self._call_count += 1
+        resp = requests.get(url, headers=headers, timeout=300)
+        resp.raise_for_status()
+        data = resp.json()
+
+        candidates = data.get("candidates", [])
+        matched = [c for c in candidates if c.get("match_status") == "matched"]
+        logger.info(
+            f"  → {len(matched)} matched candidates "
+            f"(of {len(candidates)} total)"
+        )
+        return matched
+
+    def findall_add_enrichment(
+        self,
+        findall_id: str,
+        output_schema: dict,
+        processor: str = "base",
+    ) -> dict:
+        """Add an enrichment to a FindAll run.
+
+        Args:
+            findall_id: The FindAll run ID.
+            output_schema: JSON schema for enrichment output fields.
+            processor: Task API processor for enrichment ('lite', 'base', etc.).
+
+        Returns:
+            API response dict.
+        """
+        url = f"{self.base_url}/v1beta/findall/runs/{findall_id}/enrich"
+        payload = {
+            "generator": processor,
+            "output_schema": {
+                "type": "json",
+                "json_schema": output_schema,
+            },
+        }
+
+        logger.info(f"FINDALL ENRICH: {findall_id} (processor={processor})")
+        result = self._request("POST", url, self._headers_findall(), payload)
+        logger.info(f"  → Enrichment added")
+        return result
 
     @property
     def call_count(self) -> int:
