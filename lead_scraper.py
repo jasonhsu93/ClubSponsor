@@ -33,6 +33,7 @@ import time
 import dns.resolver
 import pandas as pd
 import phonenumbers
+import requests
 from thefuzz import fuzz
 
 from api_client import ParallelClient
@@ -75,6 +76,20 @@ KNOWN_DIRECTORIES: dict[str, str] = {
     "Simon Fraser University": "https://go.sfss.ca/clubs/list",
     "Dalhousie University": "https://dsu.ca/clubs-societies",
     "University of Manitoba": "https://umsu.ca/clubs/",
+}
+
+# amsclubs.ca-specific constants
+AMS_CLUBS_BASE = "https://amsclubs.ca"
+
+# Map amsclubs.ca categories → our categories
+AMSCLUBS_CATEGORY_MAP: dict[str, str] = {
+    "academic": "Academic",
+    "athletic or recreation": "Sports",
+    "cultural or identity": "Cultural",
+    "grassroots or political": "Political",
+    "leisure or hobby": "Social",
+    "media or performance": "Arts",
+    "other": "Other",
 }
 
 
@@ -312,6 +327,95 @@ STAGE2_SCHEMA = {
 }
 
 
+AMS_CLUBS_SITEMAP = "https://amsclubs.ca/clubs_sitemap.xml"
+
+# Slugs that appear in the sitemap but are not actual clubs
+_AMS_SKIP_SLUGS = frozenset({
+    "all-clubs", "all-events", "login", "contact-us", "wp-content",
+    "wp-admin", "wp-login", "wp-json", "feed", "xmlrpc",
+})
+
+
+def _slug_to_name(slug: str) -> str:
+    """Convert a URL slug like 'ai-club' → 'AI Club'.
+
+    Handles common abbreviations (UBC, AI, STEM, etc.)."""
+    UPPER = {
+        "ubc", "ai", "bc", "stem", "hk", "msf", "it", "ieee",
+        "irc", "grsj", "ires", "capsi", "csss", "usu", "bmm",
+        "cvc", "nomas", "ux", "nwplus", "aiesec", "ecegsa",
+        "citr", "sisu", "brasa", "devec", "mexsa", "canfar",
+    }
+    words = slug.split("-")
+    titled: list[str] = []
+    for w in words:
+        if w.lower() in UPPER:
+            titled.append(w.upper())
+        else:
+            titled.append(w.capitalize())
+    return " ".join(titled)
+
+
+def _extract_amsclubs_directory(
+    client: ParallelClient,          # kept for API-compat; not used
+    max_clubs: int = 500,
+) -> list[dict]:
+    """Fetch all club URLs from the Yoast SEO clubs sitemap.
+
+    The amsclubs.ca directory pages are JS-rendered and cannot be read by
+    the Extract API.  The Yoast sitemap at /clubs_sitemap.xml lists every
+    club URL in plain XML, so we fetch it directly with *requests* — zero
+    API calls needed.
+
+    Returns:
+        List of club dicts with club_name, club_description, club_website,
+        club_category.
+    """
+    import xml.etree.ElementTree as ET
+
+    print(f"  Fetching clubs sitemap from {AMS_CLUBS_SITEMAP}...")
+
+    try:
+        resp = requests.get(AMS_CLUBS_SITEMAP, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  ⚠ Failed to fetch sitemap: {e}")
+        return []
+
+    # Parse the XML — namespace-aware
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as e:
+        print(f"  ⚠ Failed to parse sitemap XML: {e}")
+        return []
+
+    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    loc_elements = root.findall(".//sm:url/sm:loc", ns)
+
+    clubs: list[dict] = []
+    seen_slugs: set[str] = set()
+
+    for loc_el in loc_elements:
+        url = (loc_el.text or "").strip().rstrip("/")
+        if not url or "amsclubs.ca" not in url:
+            continue
+        # Extract slug from URL: https://amsclubs.ca/<slug>/
+        slug = url.rsplit("/", 1)[-1]
+        if not slug or slug in _AMS_SKIP_SLUGS or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+
+        clubs.append({
+            "club_name": _slug_to_name(slug),
+            "club_description": "",            # filled in Stage 3
+            "club_website": url + "/",
+            "club_category": "",               # filled in Stage 3
+        })
+
+    print(f"  ✅ Parsed {len(clubs)} clubs from amsclubs.ca sitemap (0 API calls)")
+    return clubs[:max_clubs]
+
+
 def run_stage2(
     client: ParallelClient,
     max_clubs: int = 100,
@@ -320,10 +424,13 @@ def run_stage2(
 ) -> list[dict]:
     """Enumerate up to max_clubs at the target university.
 
+    For UBC (amsclubs.ca), directly extracts the paginated club directory
+    for comprehensive coverage of all 449+ clubs.  For other universities,
+    falls back to the generic Search → Extract → Chat pipeline.
+
     Args:
-        timeout: Wallclock limit in seconds for the Search → Extract → Chat
-                 sequence.  If exceeded between steps and at least 2 clubs
-                 have already been found, remaining steps are skipped.
+        timeout: Wallclock limit in seconds for the generic pipeline.
+                 Not applied to the amsclubs.ca path (it's fast enough).
     """
     print("\n" + "=" * 60)
     print("STAGE 2: Enumerate Clubs")
@@ -346,6 +453,25 @@ def run_stage2(
             return existing
 
     print(f"\nProcessing: {uni_name}")
+
+    # ── amsclubs.ca fast path (UBC) ────────────────────────────
+    dir_url = uni.get("clubs_directory_url", "")
+    if "amsclubs.ca" in dir_url:
+        print(f"  🏫 Detected amsclubs.ca directory — using direct extraction")
+        clubs = _extract_amsclubs_directory(client, max_clubs=max_clubs)
+
+        # Annotate each club
+        for club in clubs:
+            club["university"] = uni_name
+            club["province"] = uni.get("province", "") or "British Columbia"
+            club["source_urls"] = [club.get("club_website", "")]
+
+        print(f"  → Found {len(clubs)} clubs at {uni_name}")
+        save_checkpoint(clubs, STAGE2_FILE)
+        print(f"\nTotal API calls so far: {client.call_count}")
+        return clubs
+
+    # ── Generic path (non-amsclubs universities) ───────────────
     stage2_start = time.time()
 
     def _remaining() -> float:
@@ -596,7 +722,7 @@ def run_stage2_findall(
 
 
 # =========================================================================
-# STAGE 3: Find Sponsorship Contacts via Task Group API
+# STAGE 3: Find Sponsorship Contacts
 # =========================================================================
 
 # Task spec for contact lookup — flat object, all fields required,
@@ -610,7 +736,12 @@ TASK_INPUT_SCHEMA = {
         },
         "club_website": {
             "type": "string",
-            "description": "Club website or social media URL (may be empty)",
+            "description": (
+                "Club website or social media URL. For UBC clubs this is "
+                "usually https://amsclubs.ca/<slug>/ which has a Contact "
+                "section with an email and an Our Team section with names "
+                "and roles. Check this URL first."
+            ),
         },
         "university": {
             "type": "string",
@@ -665,19 +796,215 @@ TASK_SPEC = {
     "output_schema": {"json_schema": TASK_OUTPUT_SCHEMA},
 }
 
+# Regex helpers for parsing amsclubs.ca individual club pages
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+_TEAM_ROLE_RE = re.compile(
+    r'^\s*(.+?)\s*[:\u2013\u2014-]\s*(.+)$',  # "Name : Role" or "Name – Role"
+)
+
+
+def _extract_amsclubs_contacts(
+    client: ParallelClient,
+    clubs: list[dict],
+) -> list[dict]:
+    """Extract contacts directly from amsclubs.ca club pages via Extract API.
+
+    Each amsclubs.ca club page has:
+      - A **Contact** section with a general email (usually @gmail.com)
+      - An **Our Team** section listing members with Name, Role, and
+        sometimes personal email links.
+
+    We batch-Extract 3 URLs at a time, then parse the returned content
+    for emails and team members.
+    """
+    contacts: list[dict] = []
+    batch_size = 3
+    total = len(clubs)
+
+    for i in range(0, total, batch_size):
+        batch = clubs[i : i + batch_size]
+        urls = [c["club_website"] for c in batch if c.get("club_website")]
+        if not urls:
+            for c in batch:
+                contacts.append(_empty_contact(c))
+            continue
+
+        print(f"    Extracting contacts {i + 1}\u2013{min(i + batch_size, total)}/{total}...",
+              end="\r")
+
+        try:
+            result = client.extract(
+                urls=urls,
+                objective=(
+                    "Find the club contact email address and team member "
+                    "names with their roles (especially President, VP "
+                    "Sponsorship, VP Finance, Treasurer, VP External)"
+                ),
+                excerpts=True,
+                full_content=True,
+            )
+        except Exception as e:
+            logger.warning(f"  Extract batch failed: {e}")
+            for c in batch:
+                contacts.append(_empty_contact(c))
+            continue
+
+        # Map URL → extracted content
+        url_to_content: dict[str, str] = {}
+        for r in result.get("results", []):
+            page_url = r.get("url", "")
+            content = r.get("full_content") or ""
+            if not content:
+                excerpts_list = r.get("excerpts", [])
+                content = "\n".join(excerpts_list)
+            url_to_content[page_url] = content
+
+        # Parse each club
+        for c in batch:
+            cw = c.get("club_website", "")
+            page_text = url_to_content.get(cw, "")
+            if not page_text:
+                contacts.append(_empty_contact(c))
+                continue
+
+            contact = _parse_amsclub_page(c, page_text)
+            contacts.append(contact)
+
+    print()  # newline after \r
+    return contacts
+
+
+def _parse_amsclub_page(club: dict, page_text: str) -> dict:
+    """Parse a single amsclubs.ca club page for contact info."""
+    emails: list[str] = _EMAIL_RE.findall(page_text)
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_emails: list[str] = []
+    for e in emails:
+        e_lower = e.lower()
+        if e_lower not in seen:
+            seen.add(e_lower)
+            unique_emails.append(e)
+
+    # The first email is usually the club's general contact email
+    club_email = unique_emails[0] if unique_emails else ""
+
+    # Parse team members from "Our Team" section
+    team_members: list[dict] = []
+    in_team = False
+    for line in page_text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Detect team section
+        if "our team" in stripped.lower() or "executive" in stripped.lower():
+            in_team = True
+            continue
+        # Detect section breaks
+        if stripped.startswith("#") and in_team:
+            if "team" not in stripped.lower() and "exec" not in stripped.lower():
+                in_team = False
+                continue
+        if not in_team:
+            continue
+
+        # Try "Name : Role" pattern
+        m = _TEAM_ROLE_RE.match(stripped)
+        if m:
+            name, role = m.group(1).strip(), m.group(2).strip()
+            if len(name) > 1 and len(role) > 1:
+                team_members.append({"name": name, "role": role})
+                continue
+
+        # Standalone lines: first line = name, next = role
+        # Common pattern on amsclubs.ca:
+        #   Lia Tulchinsky
+        #   President
+        if team_members and not team_members[-1].get("role"):
+            team_members[-1]["role"] = stripped
+        elif stripped and not stripped.startswith("[") and not stripped.startswith("!"):
+            # Check if this looks like a role keyword
+            role_keywords = [
+                "president", "vice", "treasurer", "director",
+                "coordinator", "secretary", "logistics",
+                "developer", "manager", "lead", "chair",
+            ]
+            if not any(kw in stripped.lower() for kw in role_keywords):
+                team_members.append({"name": stripped, "role": ""})
+            elif team_members:
+                if not team_members[-1].get("role"):
+                    team_members[-1]["role"] = stripped
+            else:
+                team_members.append({"name": stripped, "role": ""})
+
+    # Pick the best contact: prioritise sponsorship-related roles
+    PRIORITY_ROLES = [
+        "sponsorship", "sponsor", "finance", "treasurer",
+        "external", "vp finance", "vp external", "president",
+    ]
+    best_member: dict = {}
+    is_fallback = True
+
+    for member in team_members:
+        role_lower = member.get("role", "").lower()
+        for idx, kw in enumerate(PRIORITY_ROLES):
+            if kw in role_lower:
+                if not best_member or idx < best_member.get("_priority", 999):
+                    best_member = {**member, "_priority": idx}
+                    if idx < len(PRIORITY_ROLES) - 1:  # not "president"
+                        is_fallback = False
+                    else:
+                        is_fallback = True
+                break
+
+    if not best_member and team_members:
+        best_member = team_members[0]
+        is_fallback = True
+
+    contact_name = best_member.get("name", "") if best_member else ""
+    contact_role = best_member.get("role", "") if best_member else ""
+
+    return {
+        "club_name": club.get("club_name", ""),
+        "university": club.get("university", ""),
+        "province": club.get("province", ""),
+        "contact_name": contact_name,
+        "contact_role": contact_role,
+        "contact_email": club_email,
+        "contact_phone": "",
+        "is_fallback_contact": is_fallback,
+        "source_urls": [club.get("club_website", "")],
+    }
+
+
+def _empty_contact(club: dict) -> dict:
+    """Return an empty contact dict for a club."""
+    return {
+        "club_name": club.get("club_name", ""),
+        "university": club.get("university", ""),
+        "province": club.get("province", ""),
+        "contact_name": "",
+        "contact_role": "",
+        "contact_email": "",
+        "contact_phone": "",
+        "is_fallback_contact": True,
+        "source_urls": [],
+    }
+
 
 def run_stage3(
     client: ParallelClient,
     resume: bool = False,
     processor: str = "base-fast",
 ) -> list[dict]:
-    """Find sponsorship contacts using Parallel AI Task Group API.
+    """Find sponsorship contacts for each club.
 
-    Creates a Task Group, submits one run per club, polls until complete,
-    then streams all results.
+    For clubs with amsclubs.ca URLs, directly extracts contact info from
+    each club's page via the Extract API (cheap, fast, reliable).
+    For all other clubs, falls back to the Task Group API.
     """
     print("\n" + "=" * 60)
-    print("STAGE 3: Find Sponsorship Contacts (Task Group API)")
+    print("STAGE 3: Find Sponsorship Contacts")
     print("=" * 60)
 
     # Load Stage 2 checkpoint
@@ -702,90 +1029,109 @@ def run_stage3(
     else:
         existing = []
 
+    # Split clubs: amsclubs.ca vs others
+    amsclubs_list = [
+        c for c in clubs
+        if "amsclubs.ca" in (c.get("club_website") or "")
+    ]
+    other_clubs = [
+        c for c in clubs
+        if "amsclubs.ca" not in (c.get("club_website") or "")
+    ]
+
     print(f"Clubs to process: {len(clubs)}")
-    print(f"Processor: {processor}")
+    print(f"  amsclubs.ca (direct Extract): {len(amsclubs_list)}")
+    print(f"  Other (Task Group): {len(other_clubs)}")
 
-    # --- Step A: Create Task Group ---
-    university = clubs[0].get("university", "Unknown")
-    taskgroup_id = client.create_task_group(
-        metadata={"stage": "3_contacts", "university": university}
-    )
+    contacts: list[dict] = list(existing)
 
-    # --- Step B: Build inputs and submit runs ---
-    inputs = []
-    for club in clubs:
-        inputs.append({
-            "club_name": club.get("club_name", ""),
-            "club_website": club.get("club_website", "") or "",
-            "university": club.get("university", ""),
-        })
+    # ── Path A: Direct Extract for amsclubs.ca clubs ──────────
+    if amsclubs_list:
+        print(f"\n  📧 Extracting contacts from {len(amsclubs_list)} amsclubs.ca pages...")
+        ams_contacts = _extract_amsclubs_contacts(client, amsclubs_list)
+        contacts.extend(ams_contacts)
 
-    # Task Group accepts up to 1,000 runs per call
-    all_run_ids: list[str] = []
-    batch_size = 1000
-    for i in range(0, len(inputs), batch_size):
-        batch = inputs[i : i + batch_size]
-        run_ids = client.add_task_runs(
-            taskgroup_id=taskgroup_id,
-            task_spec=TASK_SPEC,
-            inputs=batch,
-            processor=processor,
+        with_email = sum(1 for c in ams_contacts if c.get("contact_email"))
+        with_name = sum(1 for c in ams_contacts if c.get("contact_name"))
+        print(f"  amsclubs.ca results: {with_email}/{len(ams_contacts)} emails, "
+              f"{with_name}/{len(ams_contacts)} names")
+
+    # ── Path B: Task Group for other clubs ────────────────────
+    if other_clubs:
+        print(f"\n  🤖 Using Task Group for {len(other_clubs)} non-amsclubs clubs...")
+        print(f"  Processor: {processor}")
+
+        university = other_clubs[0].get("university", "Unknown")
+        taskgroup_id = client.create_task_group(
+            metadata={"stage": "3_contacts", "university": university}
         )
-        all_run_ids.extend(run_ids)
 
-    print(f"\n  Submitted {len(all_run_ids)} task runs to group {taskgroup_id}")
-    print(f"  Estimated cost: ${len(all_run_ids) * 0.01:.2f} (at $10/1K runs)")
+        inputs = []
+        for club in other_clubs:
+            inputs.append({
+                "club_name": club.get("club_name", ""),
+                "club_website": club.get("club_website", "") or "",
+                "university": club.get("university", ""),
+            })
 
-    # --- Step C: Poll until complete ---
-    print("\n  Polling for completion...")
-    status = client.poll_task_group(
-        taskgroup_id=taskgroup_id,
-        poll_interval=5.0,
-        timeout=600.0,
-    )
+        all_run_ids: list[str] = []
+        tg_batch_size = 1000
+        for i in range(0, len(inputs), tg_batch_size):
+            batch = inputs[i : i + tg_batch_size]
+            run_ids = client.add_task_runs(
+                taskgroup_id=taskgroup_id,
+                task_spec=TASK_SPEC,
+                inputs=batch,
+                processor=processor,
+            )
+            all_run_ids.extend(run_ids)
 
-    timed_out = status.get("timed_out", False)
-    counts = status.get("task_run_status_counts", {})
-    completed_count = counts.get("completed", 0)
-    failed_count = counts.get("failed", 0)
+        print(f"  Submitted {len(all_run_ids)} task runs")
+        print(f"  Estimated cost: ${len(all_run_ids) * 0.01:.2f}")
 
-    if timed_out:
-        print(f"\n  ⚠ Timed out — collecting {completed_count} partial results "
-              f"({failed_count} failed)")
-    else:
-        print(f"\n  Final: {completed_count} completed, {failed_count} failed")
+        print("\n  Polling for completion...")
+        status = client.poll_task_group(
+            taskgroup_id=taskgroup_id,
+            poll_interval=5.0,
+            timeout=600.0,
+        )
 
-    # --- Step D: Stream results (works for both complete & partial) ---
-    print("\n  Fetching results...")
-    results = client.get_task_results(taskgroup_id)
+        timed_out = status.get("timed_out", False)
+        counts = status.get("task_run_status_counts", {})
+        completed_count = counts.get("completed", 0)
+        failed_count = counts.get("failed", 0)
 
-    # --- Step E: Build contacts list ---
-    contacts: list[dict] = list(existing)  # start with any resumed data
+        if timed_out:
+            print(f"\n  ⚠ Timed out — collecting {completed_count} partial results")
+        else:
+            print(f"\n  Final: {completed_count} completed, {failed_count} failed")
 
-    for res in results:
-        inp = res.get("input", {})
-        output = res.get("output") or {}
-        basis_data = res.get("basis", [])
+        print("\n  Fetching results...")
+        results = client.get_task_results(taskgroup_id)
 
-        contact = {
-            "club_name": inp.get("club_name", ""),
-            "university": inp.get("university", ""),
-            "province": "",  # filled from clubs data below
-            "contact_name": output.get("contact_name") or "",
-            "contact_role": output.get("contact_role") or "",
-            "contact_email": output.get("contact_email") or "",
-            "contact_phone": output.get("contact_phone") or "",
-            "is_fallback_contact": output.get("is_fallback_contact", True),
-            "source_urls": ParallelClient.extract_source_urls(basis_data),
-        }
+        for res in results:
+            inp = res.get("input", {})
+            output = res.get("output") or {}
+            basis_data = res.get("basis", [])
 
-        # Fill province from clubs data
-        for club in clubs:
-            if club.get("club_name") == contact["club_name"]:
-                contact["province"] = club.get("province", "")
-                break
+            contact = {
+                "club_name": inp.get("club_name", ""),
+                "university": inp.get("university", ""),
+                "province": "",
+                "contact_name": output.get("contact_name") or "",
+                "contact_role": output.get("contact_role") or "",
+                "contact_email": output.get("contact_email") or "",
+                "contact_phone": output.get("contact_phone") or "",
+                "is_fallback_contact": output.get("is_fallback_contact", True),
+                "source_urls": ParallelClient.extract_source_urls(basis_data),
+            }
 
-        contacts.append(contact)
+            for club in other_clubs:
+                if club.get("club_name") == contact["club_name"]:
+                    contact["province"] = club.get("province", "")
+                    break
+
+            contacts.append(contact)
 
     save_checkpoint(contacts, STAGE3_FILE)
 
@@ -1042,8 +1388,8 @@ def main():
         help=f"Target university (default: {DEFAULT_UNIVERSITY})",
     )
     parser.add_argument(
-        "--max-clubs", type=int, default=100,
-        help="Max clubs to enumerate (default 100)",
+        "--max-clubs", type=int, default=500,
+        help="Max clubs to enumerate (default 500)",
     )
     parser.add_argument(
         "--stage2-timeout", type=float, default=45.0,
