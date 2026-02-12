@@ -7,7 +7,6 @@
 # Runtime artifacts
 logs/
 checkpoints/
-sponsorship_leads.csv
 
 # Python
 __pycache__/
