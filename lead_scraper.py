@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """lead_scraper.py -- Canadian Club Sponsorship Lead List Builder (v3).
 
-Four-stage pipeline backed by Parallel AI:
+Four-stage pipeline:
   1. Discover universities  -- FindAll > Chat > hardcoded QS fallback
   2. Enumerate clubs        -- sitemap for UBC, Search>Extract>Chat for others
   3. Find contacts          -- Extract (amsclubs.ca) + Task Group (everything else)
@@ -929,200 +929,6 @@ TASK_SPEC = {
     "output_schema": {"json_schema": TASK_OUTPUT_SCHEMA},
 }
 
-# Regex patterns for parsing amsclubs.ca club pages.
-_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
-_TEAM_ROLE_RE = re.compile(
-    r'^\s*(.+?)\s*[:\u2013\u2014-]\s*(.+)$',  # "Name : Role" or "Name – Role"
-)
-
-
-def _extract_amsclubs_contacts(
-    client: ParallelClient,
-    clubs: list[dict],
-) -> list[dict]:
-    """Extract contacts directly from amsclubs.ca club pages via Extract API.
-
-    Each amsclubs.ca club page has:
-      - A **Contact** section with a general email (usually @gmail.com)
-      - An **Our Team** section listing members with Name, Role, and
-        sometimes personal email links.
-
-    We batch-Extract 5 URLs at a time, then parse the returned content
-    for emails and team members.
-    """
-    contacts: list[dict] = []
-    batch_size = 5
-    total = len(clubs)
-
-    for i in range(0, total, batch_size):
-        batch = clubs[i : i + batch_size]
-        urls = [c["club_website"] for c in batch if c.get("club_website")]
-        if not urls:
-            for c in batch:
-                contacts.append(_empty_contact(c))
-            continue
-
-        print(f"    Extracting contacts {i + 1}\u2013{min(i + batch_size, total)}/{total}...",
-              end="\r")
-
-        try:
-            result = client.extract(
-                urls=urls,
-                objective=(
-                    "Find the club contact email address and team member "
-                    "names with their roles (especially President, VP "
-                    "Sponsorship, VP Finance, Treasurer, VP External)"
-                ),
-                excerpts=True,
-                full_content=True,
-            )
-        except Exception as e:
-            logger.warning(f"  Extract batch failed: {e}")
-            for c in batch:
-                contacts.append(_empty_contact(c))
-            continue
-
-        # Map URL → extracted content
-        url_to_content: dict[str, str] = {}
-        for r in result.get("results", []):
-            page_url = r.get("url", "")
-            content = r.get("full_content") or ""
-            if not content:
-                excerpts_list = r.get("excerpts", [])
-                content = "\n".join(excerpts_list)
-            url_to_content[page_url] = content
-
-        # Parse each club
-        for c in batch:
-            cw = c.get("club_website", "")
-            page_text = url_to_content.get(cw, "")
-            if not page_text:
-                contacts.append(_empty_contact(c))
-                continue
-
-            contact = _parse_amsclub_page(c, page_text)
-            contacts.append(contact)
-
-    print()  # newline after \r
-    return contacts
-
-
-def _parse_amsclub_page(club: dict, page_text: str) -> dict:
-    """Parse a single amsclubs.ca club page for contact info."""
-    emails: list[str] = _EMAIL_RE.findall(page_text)
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique_emails: list[str] = []
-    for e in emails:
-        e_lower = e.lower()
-        if e_lower not in seen:
-            seen.add(e_lower)
-            unique_emails.append(e)
-
-    # The first email is usually the club's general contact email
-    club_email = unique_emails[0] if unique_emails else ""
-
-    # Parse team members from "Our Team" section
-    team_members: list[dict] = []
-    in_team = False
-    for line in page_text.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        # Detect team section
-        if "our team" in stripped.lower() or "executive" in stripped.lower():
-            in_team = True
-            continue
-        # Detect section breaks
-        if stripped.startswith("#") and in_team:
-            if "team" not in stripped.lower() and "exec" not in stripped.lower():
-                in_team = False
-                continue
-        if not in_team:
-            continue
-
-        # Try "Name : Role" pattern
-        m = _TEAM_ROLE_RE.match(stripped)
-        if m:
-            name, role = m.group(1).strip(), m.group(2).strip()
-            if len(name) > 1 and len(role) > 1:
-                team_members.append({"name": name, "role": role})
-                continue
-
-        # Standalone lines: first line = name, next = role
-        # Common pattern on amsclubs.ca:
-        #   Lia Tulchinsky
-        #   President
-        if team_members and not team_members[-1].get("role"):
-            team_members[-1]["role"] = stripped
-        elif stripped and not stripped.startswith("[") and not stripped.startswith("!"):
-            # Check if this looks like a role keyword
-            role_keywords = [
-                "president", "vice", "treasurer", "director",
-                "coordinator", "secretary", "logistics",
-                "developer", "manager", "lead", "chair",
-            ]
-            if not any(kw in stripped.lower() for kw in role_keywords):
-                team_members.append({"name": stripped, "role": ""})
-            elif team_members:
-                if not team_members[-1].get("role"):
-                    team_members[-1]["role"] = stripped
-            else:
-                team_members.append({"name": stripped, "role": ""})
-
-    # Pick the best contact — prefer sponsorship-specific roles.
-    PRIORITY_ROLES = [
-        "sponsorship", "sponsor", "finance", "treasurer",
-        "external", "vp finance", "vp external", "president",
-    ]
-    best_member: dict = {}
-    is_fallback = True
-
-    for member in team_members:
-        role_lower = member.get("role", "").lower()
-        for idx, kw in enumerate(PRIORITY_ROLES):
-            if kw in role_lower:
-                if not best_member or idx < best_member.get("_priority", 999):
-                    best_member = {**member, "_priority": idx}
-                    if idx < len(PRIORITY_ROLES) - 1:  # not "president"
-                        is_fallback = False
-                    else:
-                        is_fallback = True
-                break
-
-    if not best_member and team_members:
-        best_member = team_members[0]
-        is_fallback = True
-
-    contact_name = best_member.get("name", "") if best_member else ""
-    contact_role = best_member.get("role", "") if best_member else ""
-
-    return {
-        "club_name": club.get("club_name", ""),
-        "university": club.get("university", ""),
-        "province": club.get("province", ""),
-        "contact_name": contact_name,
-        "contact_role": contact_role,
-        "contact_email": club_email,
-        "contact_phone": "",
-        "is_fallback_contact": is_fallback,
-        "source_urls": [club.get("club_website", "")],
-    }
-
-
-def _empty_contact(club: dict) -> dict:
-    """Return an empty contact dict for a club."""
-    return {
-        "club_name": club.get("club_name", ""),
-        "university": club.get("university", ""),
-        "province": club.get("province", ""),
-        "contact_name": "",
-        "contact_role": "",
-        "contact_email": "",
-        "contact_phone": "",
-        "is_fallback_contact": True,
-        "source_urls": [],
-    }
 
 
 def run_stage3(
@@ -1130,11 +936,11 @@ def run_stage3(
     resume: bool = False,
     processor: str = "base-fast",
 ) -> list[dict]:
-    """Find sponsorship contacts for each club.
+    """Find sponsorship contacts for each club via the Task Group API.
 
-    For clubs with amsclubs.ca URLs, directly extracts contact info from
-    each club's page via the Extract API (cheap, fast, reliable).
-    For all other clubs, falls back to the Task Group API.
+    All clubs (including amsclubs.ca) are sent through a single Task Group.
+    The task description already tells the AI where to look for contacts on
+    amsclubs.ca pages (Contact section + Our Team section).
     """
     print("\n" + "=" * 60)
     print("STAGE 3: Find Sponsorship Contacts")
@@ -1162,109 +968,90 @@ def run_stage3(
     else:
         existing = []
 
-    # Split clubs: amsclubs.ca vs others
-    amsclubs_list = [
-        c for c in clubs
-        if "amsclubs.ca" in (c.get("club_website") or "")
-    ]
-    other_clubs = [
-        c for c in clubs
-        if "amsclubs.ca" not in (c.get("club_website") or "")
-    ]
-
     print(f"Clubs to process: {len(clubs)}")
-    print(f"  amsclubs.ca (direct Extract): {len(amsclubs_list)}")
-    print(f"  Other (Task Group): {len(other_clubs)}")
+    print(f"Processor: {processor}")
 
     contacts: list[dict] = list(existing)
 
-    # ── Path A: Direct Extract for amsclubs.ca clubs ──────────
-    if amsclubs_list:
-        print(f"\n  📧 Extracting contacts from {len(amsclubs_list)} amsclubs.ca pages...")
-        ams_contacts = _extract_amsclubs_contacts(client, amsclubs_list)
-        contacts.extend(ams_contacts)
+    # ── Task Group for ALL clubs ──────────────────────────────
+    if not clubs:
+        save_checkpoint(contacts, STAGE3_FILE)
+        return contacts
 
-        with_email = sum(1 for c in ams_contacts if c.get("contact_email"))
-        with_name = sum(1 for c in ams_contacts if c.get("contact_name"))
-        print(f"  amsclubs.ca results: {with_email}/{len(ams_contacts)} emails, "
-              f"{with_name}/{len(ams_contacts)} names")
+    university = clubs[0].get("university", "Unknown")
+    taskgroup_id = client.create_task_group(
+        metadata={"stage": "3_contacts", "university": university}
+    )
 
-    # ── Path B: Task Group for other clubs ────────────────────
-    if other_clubs:
-        print(f"\n  🤖 Using Task Group for {len(other_clubs)} non-amsclubs clubs...")
-        print(f"  Processor: {processor}")
+    inputs = []
+    for club in clubs:
+        inputs.append({
+            "club_name": club.get("club_name", ""),
+            "club_website": club.get("club_website", "") or "",
+            "university": club.get("university", ""),
+        })
 
-        university = other_clubs[0].get("university", "Unknown")
-        taskgroup_id = client.create_task_group(
-            metadata={"stage": "3_contacts", "university": university}
-        )
-
-        inputs = []
-        for club in other_clubs:
-            inputs.append({
-                "club_name": club.get("club_name", ""),
-                "club_website": club.get("club_website", "") or "",
-                "university": club.get("university", ""),
-            })
-
-        all_run_ids: list[str] = []
-        tg_batch_size = 1000
-        for i in range(0, len(inputs), tg_batch_size):
-            batch = inputs[i : i + tg_batch_size]
-            run_ids = client.add_task_runs(
-                taskgroup_id=taskgroup_id,
-                task_spec=TASK_SPEC,
-                inputs=batch,
-                processor=processor,
-            )
-            all_run_ids.extend(run_ids)
-
-        print(f"  Submitted {len(all_run_ids)} task runs")
-        print(f"  Estimated cost: ${len(all_run_ids) * 0.01:.2f}")
-
-        print("\n  Polling for completion...")
-        status = client.poll_task_group(
+    all_run_ids: list[str] = []
+    tg_batch_size = 1000
+    for i in range(0, len(inputs), tg_batch_size):
+        batch = inputs[i : i + tg_batch_size]
+        run_ids = client.add_task_runs(
             taskgroup_id=taskgroup_id,
-            poll_interval=3.0,
-            timeout=600.0,
+            task_spec=TASK_SPEC,
+            inputs=batch,
+            processor=processor,
         )
+        all_run_ids.extend(run_ids)
 
-        timed_out = status.get("timed_out", False)
-        counts = status.get("task_run_status_counts", {})
-        completed_count = counts.get("completed", 0)
-        failed_count = counts.get("failed", 0)
+    print(f"  Submitted {len(all_run_ids)} task runs")
+    print(f"  Estimated cost: ${len(all_run_ids) * 0.01:.2f}")
 
-        if timed_out:
-            print(f"\n  ⚠ Timed out — collecting {completed_count} partial results")
-        else:
-            print(f"\n  Final: {completed_count} completed, {failed_count} failed")
+    print("\n  Polling for completion...")
+    status = client.poll_task_group(
+        taskgroup_id=taskgroup_id,
+        poll_interval=3.0,
+        timeout=600.0,
+    )
 
-        print("\n  Fetching results...")
-        results = client.get_task_results(taskgroup_id)
+    timed_out = status.get("timed_out", False)
+    stalled = status.get("stalled", False)
+    counts = status.get("task_run_status_counts", {})
+    completed_count = counts.get("completed", 0)
+    failed_count = counts.get("failed", 0)
 
-        for res in results:
-            inp = res.get("input", {})
-            output = res.get("output") or {}
-            basis_data = res.get("basis", [])
+    if stalled:
+        print(f"\n  ⚠ Stalled — collecting {completed_count} partial results")
+    elif timed_out:
+        print(f"\n  ⚠ Timed out — collecting {completed_count} partial results")
+    else:
+        print(f"\n  Final: {completed_count} completed, {failed_count} failed")
 
-            contact = {
-                "club_name": inp.get("club_name", ""),
-                "university": inp.get("university", ""),
-                "province": "",
-                "contact_name": output.get("contact_name") or "",
-                "contact_role": output.get("contact_role") or "",
-                "contact_email": output.get("contact_email") or "",
-                "contact_phone": output.get("contact_phone") or "",
-                "is_fallback_contact": output.get("is_fallback_contact", True),
-                "source_urls": ParallelClient.extract_source_urls(basis_data),
-            }
+    print("\n  Fetching results...")
+    results = client.get_task_results(taskgroup_id)
 
-            for club in other_clubs:
-                if club.get("club_name") == contact["club_name"]:
-                    contact["province"] = club.get("province", "")
-                    break
+    for res in results:
+        inp = res.get("input", {})
+        output = res.get("output") or {}
+        basis_data = res.get("basis", [])
 
-            contacts.append(contact)
+        contact = {
+            "club_name": inp.get("club_name", ""),
+            "university": inp.get("university", ""),
+            "province": "",
+            "contact_name": output.get("contact_name") or "",
+            "contact_role": output.get("contact_role") or "",
+            "contact_email": output.get("contact_email") or "",
+            "contact_phone": output.get("contact_phone") or "",
+            "is_fallback_contact": output.get("is_fallback_contact", True),
+            "source_urls": ParallelClient.extract_source_urls(basis_data),
+        }
+
+        for club in clubs:
+            if club.get("club_name") == contact["club_name"]:
+                contact["province"] = club.get("province", "")
+                break
+
+        contacts.append(contact)
 
     save_checkpoint(contacts, STAGE3_FILE)
 

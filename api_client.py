@@ -446,18 +446,25 @@ class ParallelClient:
         taskgroup_id: str,
         poll_interval: float = 5.0,
         timeout: float = 600.0,
+        stall_limit: int = 6,
     ) -> dict:
         """Poll a Task Group until all runs complete.
 
         Returns:
             Final status dict with num_task_runs, task_run_status_counts, etc.
-            If the timeout is reached, the dict includes ``"timed_out": True``
-            so callers can handle partial results gracefully.
+            Additional flags:
+            - ``"timed_out": True`` if timeout reached.
+            - ``"stalled": True`` if no progress for *stall_limit* consecutive
+              polls (prevents hanging when 1-2 tasks never finish).
         """
         url = f"{self.base_url}/v1beta/tasks/groups/{taskgroup_id}"
         headers = self._headers_task()
         start = time.time()
         status: dict = {}  # initialise in case timeout fires on first iteration
+
+        prev_completed = -1
+        prev_failed = -1
+        stall_count = 0
 
         while True:
             elapsed = time.time() - start
@@ -500,6 +507,23 @@ class ParallelClient:
                     f"  Task Group complete: {completed} completed, {failed} failed"
                 )
                 return status
+
+            # Stall detection: exit early if nothing changes
+            if completed == prev_completed and failed == prev_failed:
+                stall_count += 1
+                if stall_count >= stall_limit:
+                    print()  # newline after \r
+                    logger.warning(
+                        f"  Task Group stalled: {completed}/{total} completed, "
+                        f"{failed} failed — no progress for "
+                        f"{stall_count} polls ({stall_count * poll_interval:.0f}s)"
+                    )
+                    status["stalled"] = True
+                    return status
+            else:
+                stall_count = 0
+            prev_completed = completed
+            prev_failed = failed
 
             time.sleep(poll_interval)
 
