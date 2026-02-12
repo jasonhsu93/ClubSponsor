@@ -1,8 +1,14 @@
-"""
-api_client.py - Parallel AI API wrapper
+"""api_client.py -- Parallel AI API wrapper.
 
-Provides a reusable client for Parallel AI's Search, Extract, and Chat APIs
-with built-in rate limiting, retry logic, and logging.
+Provides a reusable client for all five Parallel AI endpoint families:
+  - Search     -- web search with excerpts
+  - Extract    -- page content extraction
+  - Chat       -- LLM completions with optional web research
+  - Task Group -- batch async task execution
+  - FindAll    -- entity discovery with match conditions
+
+Features: automatic rate-limiting, exponential-backoff retries, structured
+JSON logging to ``logs/``, and a call counter for cost tracking.
 """
 
 from __future__ import annotations
@@ -12,7 +18,7 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -61,9 +67,21 @@ logger.addHandler(_ch)
 # ---------------------------------------------------------------------------
 
 class ParallelClient:
-    """Wrapper for Parallel AI's Search, Extract, and Chat APIs."""
+    """Unified client for Parallel AI's Search, Extract, Chat, Task Group,
+    and FindAll APIs.
 
-    def __init__(self, api_key: str = API_KEY, base_url: str = BASE_URL, sleep: float = DEFAULT_SLEEP):
+    Args:
+        api_key:  Parallel AI API key (defaults to ``PARALLEL_API_KEY`` env var).
+        base_url: API base URL.
+        sleep:    Minimum seconds between consecutive requests (rate-limit).
+    """
+
+    def __init__(
+        self,
+        api_key: str = API_KEY,
+        base_url: str = BASE_URL,
+        sleep: float = DEFAULT_SLEEP,
+    ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.sleep = sleep
@@ -71,11 +89,10 @@ class ParallelClient:
         self._last_call_time = 0.0
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers  (headers, rate-limiting, retries)
     # ------------------------------------------------------------------
 
     def _headers_search_extract(self) -> dict:
-        """Headers for Search and Extract endpoints."""
         return {
             "Content-Type": "application/json",
             "x-api-key": self.api_key,
@@ -83,21 +100,24 @@ class ParallelClient:
         }
 
     def _headers_chat(self) -> dict:
-        """Headers for Chat endpoint."""
         return {
             "Content-Type": "application/json",
             "x-api-key": self.api_key,
         }
 
     def _rate_limit(self):
-        """Enforce minimum time between API calls."""
+        """Sleep if needed to stay under the per-minute rate cap."""
         elapsed = time.time() - self._last_call_time
         if elapsed < self.sleep:
             time.sleep(self.sleep - elapsed)
         self._last_call_time = time.time()
 
     def _request(self, method: str, url: str, headers: dict, payload: dict) -> dict:
-        """Make an HTTP request with retry and exponential backoff."""
+        """Send a request with automatic retries and exponential back-off.
+
+        Retries on 429 (rate-limit), 5xx (server errors), timeouts, and
+        connection errors.  Raises immediately on other 4xx client errors.
+        """
         self._rate_limit()
         self._call_count += 1
 
@@ -362,7 +382,6 @@ class ParallelClient:
     # ------------------------------------------------------------------
 
     def _headers_task(self) -> dict:
-        """Headers for Task / Task Group endpoints."""
         return {
             "Content-Type": "application/json",
             "x-api-key": self.api_key,
@@ -566,7 +585,6 @@ class ParallelClient:
     FINDALL_BETA_HEADER = "findall-2025-09-15"
 
     def _headers_findall(self) -> dict:
-        """Headers for FindAll endpoints."""
         return {
             "Content-Type": "application/json",
             "x-api-key": self.api_key,
@@ -766,7 +784,7 @@ class ParallelClient:
 
         logger.info(f"FINDALL ENRICH: {findall_id} (processor={processor})")
         result = self._request("POST", url, self._headers_findall(), payload)
-        logger.info(f"  → Enrichment added")
+        logger.info("  → Enrichment added")
         return result
 
     @property

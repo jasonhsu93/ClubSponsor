@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""
-lead_scraper.py - Canadian Club Sponsorship Lead List Builder (v3)
+"""lead_scraper.py -- Canadian Club Sponsorship Lead List Builder (v3).
 
-Uses Parallel AI's Search, Extract, Chat, Task Group, and FindAll APIs to:
-1. Discover top N Canadian universities by QS ranking (FindAll)
-2. Enumerate clubs at EACH university (sitemap for UBC, generic for others)
-3. Find sponsorship contacts for ALL clubs (single Task Group + Extract)
-4. Validate and export to CSV
+Four-stage pipeline backed by Parallel AI:
+  1. Discover universities  -- FindAll > Chat > hardcoded QS fallback
+  2. Enumerate clubs        -- sitemap for UBC, Search>Extract>Chat for others
+  3. Find contacts          -- Extract (amsclubs.ca) + Task Group (everything else)
+  4. Validate & export CSV  -- email/MX checks, dedup, quality scoring
 
 Usage:
-    python lead_scraper.py --test                                 # Smoke test
-    python lead_scraper.py --all                                  # Top 10 unis
-    python lead_scraper.py --all --top-n 5                        # Top 5 unis
-    python lead_scraper.py --all --university "McGill University"  # Single uni
-    python lead_scraper.py --stage 1                              # Run stage 1
-    python lead_scraper.py --stage 2                              # Run stage 2
-    python lead_scraper.py --stage 3                              # Run stage 3
-    python lead_scraper.py --stage 4                              # Run stage 4
-    python lead_scraper.py --stage 3 --resume                     # Resume
-    python lead_scraper.py --max-clubs 30 --all                   # Cap clubs/uni
+    python lead_scraper.py --test                                  # smoke test
+    python lead_scraper.py --all                                   # top 10 unis
+    python lead_scraper.py --all --top-n 5                         # top 5 unis
+    python lead_scraper.py --all --university "McGill University"   # single uni
+    python lead_scraper.py --stage 1                               # one stage
+    python lead_scraper.py --stage 3 --resume                      # resume
+    python lead_scraper.py --max-clubs 30 --all                    # cap clubs
 """
 
 from __future__ import annotations
@@ -40,7 +36,7 @@ from thefuzz import fuzz
 from api_client import ParallelClient
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths & logging
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
@@ -49,7 +45,7 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 STAGE1_FILE = os.path.join(CHECKPOINT_DIR, "stage1_universities.json")
 STAGE2_FILE = os.path.join(CHECKPOINT_DIR, "stage2_clubs.json")
 STAGE3_FILE = os.path.join(CHECKPOINT_DIR, "stage3_contacts.json")
-OUTPUT_CSV = os.path.join(BASE_DIR, "sponsorship_leads.csv")
+OUTPUT_CSV  = os.path.join(BASE_DIR, "sponsorship_leads.csv")
 
 logger = logging.getLogger("lead_scraper")
 logger.setLevel(logging.INFO)
@@ -60,8 +56,11 @@ if not logger.handlers:
 
 
 # ---------------------------------------------------------------------------
-# Well-known club directory URLs (saves an API call when available)
+# Reference data  (known directories, QS rankings, amsclubs.ca constants)
 # ---------------------------------------------------------------------------
+
+# Maps university name → student-clubs directory URL.
+# If a university is in this dict we skip the Search step entirely.
 KNOWN_DIRECTORIES: dict[str, str] = {
     "University of British Columbia": "https://amsclubs.ca/all-clubs/",
     "University of Toronto": "https://sop.utoronto.ca/groups/",
@@ -79,8 +78,7 @@ KNOWN_DIRECTORIES: dict[str, str] = {
     "University of Manitoba": "https://umsu.ca/clubs/",
 }
 
-# Hardcoded QS-ranked Canadian universities (offline fallback)
-# Source: QS World University Rankings 2025 — top 15 Canadian universities
+# Offline fallback: QS World University Rankings 2025 — top 15 Canadian.
 QS_TOP_CANADIAN: list[dict] = [
     {"university": "University of Toronto", "province": "Ontario"},
     {"university": "McGill University", "province": "Quebec"},
@@ -99,10 +97,10 @@ QS_TOP_CANADIAN: list[dict] = [
     {"university": "University of Manitoba", "province": "Manitoba"},
 ]
 
-# amsclubs.ca-specific constants
+# amsclubs.ca (UBC) — used by the sitemap parser and contact extractor.
 AMS_CLUBS_BASE = "https://amsclubs.ca"
 
-# Map amsclubs.ca categories → our categories
+# Category slug → normalised category name.
 AMSCLUBS_CATEGORY_MAP: dict[str, str] = {
     "academic": "Academic",
     "athletic or recreation": "Sports",
@@ -115,7 +113,7 @@ AMSCLUBS_CATEGORY_MAP: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint helpers
+# Checkpoint helpers  (JSON save / load)
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(data, filepath):
@@ -139,13 +137,13 @@ def load_checkpoint(filepath):
 
 
 # =========================================================================
-# PHASE 0: Smoke Test
+# SMOKE TEST
 # =========================================================================
 
-def run_smoke_test(client: ParallelClient):
-    """Test API connectivity with one Search call and one Chat call."""
+def run_smoke_test(client: ParallelClient) -> bool:
+    """Quick connectivity check: one Search call + one Chat call."""
     print("\n" + "=" * 60)
-    print("PHASE 0: Smoke Test")
+    print("SMOKE TEST")
     print("=" * 60)
 
     # --- Test 1: Search API ---
@@ -207,7 +205,7 @@ def run_smoke_test(client: ParallelClient):
 
 
 # =========================================================================
-# STAGE 1: Discover Top N Canadian Universities (FindAll or single-uni)
+# STAGE 1 — Discover Universities
 # =========================================================================
 
 def run_stage1(
@@ -537,7 +535,7 @@ def _discover_universities_chat(
 
 
 # =========================================================================
-# STAGE 2: Enumerate Clubs at the University
+# STAGE 2 — Enumerate Clubs
 # =========================================================================
 
 STAGE2_SCHEMA = {
@@ -579,7 +577,7 @@ STAGE2_SCHEMA = {
 
 AMS_CLUBS_SITEMAP = "https://amsclubs.ca/clubs_sitemap.xml"
 
-# Slugs that appear in the sitemap but are not actual clubs
+# Sitemap slugs to skip (not actual clubs).
 _AMS_SKIP_SLUGS = frozenset({
     "all-clubs", "all-events", "login", "contact-us", "wp-content",
     "wp-admin", "wp-login", "wp-json", "feed", "xmlrpc",
@@ -587,10 +585,8 @@ _AMS_SKIP_SLUGS = frozenset({
 
 
 def _slug_to_name(slug: str) -> str:
-    """Convert a URL slug like 'ai-club' → 'AI Club'.
-
-    Handles common abbreviations (UBC, AI, STEM, etc.)."""
-    UPPER = {
+    """Convert a URL slug like ``'ai-club'`` → ``'AI Club'``."""
+    _ALWAYS_UPPER = {
         "ubc", "ai", "bc", "stem", "hk", "msf", "it", "ieee",
         "irc", "grsj", "ires", "capsi", "csss", "usu", "bmm",
         "cvc", "nomas", "ux", "nwplus", "aiesec", "ecegsa",
@@ -599,7 +595,7 @@ def _slug_to_name(slug: str) -> str:
     words = slug.split("-")
     titled: list[str] = []
     for w in words:
-        if w.lower() in UPPER:
+        if w.lower() in _ALWAYS_UPPER:
             titled.append(w.upper())
         else:
             titled.append(w.capitalize())
@@ -860,11 +856,10 @@ def _enumerate_clubs_generic(
 
 
 # =========================================================================
-# STAGE 3: Find Sponsorship Contacts
+# STAGE 3 — Find Sponsorship Contacts
 # =========================================================================
 
-# Task spec for contact lookup — flat object, all fields required,
-# nullable via union types for the Task API.
+# Task Group schemas: flat objects with nullable union types.
 TASK_INPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -934,7 +929,7 @@ TASK_SPEC = {
     "output_schema": {"json_schema": TASK_OUTPUT_SCHEMA},
 }
 
-# Regex helpers for parsing amsclubs.ca individual club pages
+# Regex patterns for parsing amsclubs.ca club pages.
 _EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
 _TEAM_ROLE_RE = re.compile(
     r'^\s*(.+?)\s*[:\u2013\u2014-]\s*(.+)$',  # "Name : Role" or "Name – Role"
@@ -1075,7 +1070,7 @@ def _parse_amsclub_page(club: dict, page_text: str) -> dict:
             else:
                 team_members.append({"name": stripped, "role": ""})
 
-    # Pick the best contact: prioritise sponsorship-related roles
+    # Pick the best contact — prefer sponsorship-specific roles.
     PRIORITY_ROLES = [
         "sponsorship", "sponsor", "finance", "treasurer",
         "external", "vp finance", "vp external", "president",
@@ -1285,7 +1280,7 @@ def run_stage3(
 
 
 # =========================================================================
-# STAGE 4: Validate, Deduplicate & Export CSV
+# STAGE 4 — Validate, Deduplicate & Export CSV
 # =========================================================================
 
 def validate_email(email: str) -> bool:
@@ -1495,7 +1490,7 @@ def run_stage4():
 
 
 # =========================================================================
-# CLI
+# CLI  (argparse entry-point)
 # =========================================================================
 
 

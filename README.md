@@ -1,6 +1,6 @@
 # ClubSponsor
 
-Build a CSV lead list of sponsorship contacts for student clubs at a Canadian university using [Parallel AI](https://parallel.ai).
+Build a CSV lead list of sponsorship contacts for student clubs at top Canadian universities using [Parallel AI](https://parallel.ai).
 
 ## First-Time Setup
 
@@ -25,25 +25,38 @@ Each stage checkpoints its output so you can stop/resume at any point.
 # Smoke test — verify API key works (1 Search + 1 Chat call)
 python lead_scraper.py --test
 
-# Run all 4 stages end-to-end (defaults to UBC)
+# Run all 4 stages for the top 10 QS-ranked Canadian universities
 python lead_scraper.py --all
 
-# Target a different university
+# Limit to top 5 universities
+python lead_scraper.py --all --top-n 5
+
+# Target a single university (skips discovery)
 python lead_scraper.py --all --university "McGill University"
 
-# Or run stages individually
-python lead_scraper.py --stage 1              # Resolve directory URL
-python lead_scraper.py --stage 2              # Enumerate clubs (≤100)
-python lead_scraper.py --stage 3              # Find contacts (Task Group API)
-python lead_scraper.py --stage 4              # Validate, deduplicate, export CSV
+# Run stages individually
+python lead_scraper.py --stage 1              # Discover universities
+python lead_scraper.py --stage 2              # Enumerate clubs
+python lead_scraper.py --stage 3              # Find contacts
+python lead_scraper.py --stage 4              # Validate & export CSV
 
 # Resume Stage 3 if interrupted
 python lead_scraper.py --stage 3 --resume
 
-# Cap clubs or use a different Task processor
-python lead_scraper.py --all --max-clubs 50
-python lead_scraper.py --all --processor lite-fast
+# Tune performance
+python lead_scraper.py --all --max-clubs 30          # Cap clubs per university
+python lead_scraper.py --all --processor lite-fast   # Cheaper Task processor
+python lead_scraper.py --all --stage2-timeout 60     # More time per university
 ```
+
+## Pipeline Stages
+
+| Stage | What it does | Key technique |
+|-------|-------------|---------------|
+| **1. Discover** | Find top N Canadian universities by QS ranking | FindAll → Chat → hardcoded fallback |
+| **2. Enumerate** | List clubs at each university | Sitemap (UBC) or Search→Extract→Chat |
+| **3. Contacts** | Find sponsorship contacts per club | Extract (amsclubs.ca) + Task Group (others) |
+| **4. Export** | Validate emails, deduplicate, score quality | MX checks, fuzzy dedup, CSV export |
 
 ## Output
 
@@ -70,11 +83,11 @@ python lead_scraper.py --all --processor lite-fast
 ## Project Structure
 
 ```
-api_client.py       # Parallel AI API wrapper (Search, Extract, Chat, Task Group)
-lead_scraper.py     # 4-stage pipeline + CLI (v2)
+lead_scraper.py     # 4-stage pipeline + CLI (v3)
+api_client.py       # Parallel AI API wrapper (Search, Extract, Chat, Task Group, FindAll)
 requirements.txt    # Python dependencies
-PLAN.md             # Architecture & API reference
 .env.example        # Template for API key
+PLAN.md             # Architecture & API reference
 checkpoints/        # Stage output JSONs (gitignored)
 logs/               # API call logs (gitignored)
 ```
