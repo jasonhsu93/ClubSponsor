@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-lead_scraper.py - Canadian Club Sponsorship Lead List Builder (v2)
+lead_scraper.py - Canadian Club Sponsorship Lead List Builder (v3)
 
-Uses Parallel AI's Search, Extract, Chat, and Task Group APIs to:
-1. Resolve the target university's clubs directory URL
-2. Enumerate up to 100 clubs at that university
-3. Find sponsorship contacts for each club via Task Group (base-fast)
+Uses Parallel AI's Search, Extract, Chat, Task Group, and FindAll APIs to:
+1. Discover top N Canadian universities by QS ranking (FindAll)
+2. Enumerate clubs at EACH university (sitemap for UBC, generic for others)
+3. Find sponsorship contacts for ALL clubs (single Task Group + Extract)
 4. Validate and export to CSV
 
 Usage:
-    python lead_scraper.py --test                                 # Smoke test API key
+    python lead_scraper.py --test                                 # Smoke test
+    python lead_scraper.py --all                                  # Top 10 unis
+    python lead_scraper.py --all --top-n 5                        # Top 5 unis
+    python lead_scraper.py --all --university "McGill University"  # Single uni
     python lead_scraper.py --stage 1                              # Run stage 1
     python lead_scraper.py --stage 2                              # Run stage 2
     python lead_scraper.py --stage 3                              # Run stage 3
     python lead_scraper.py --stage 4                              # Run stage 4
-    python lead_scraper.py --all                                  # Run all stages 1-4
-    python lead_scraper.py --all --university "McGill University"  # Different uni
-    python lead_scraper.py --stage 3 --resume                     # Resume from checkpoint
-    python lead_scraper.py --max-clubs 50 --all                   # Cap clubs
+    python lead_scraper.py --stage 3 --resume                     # Resume
+    python lead_scraper.py --max-clubs 30 --all                   # Cap clubs/uni
 """
 
 from __future__ import annotations
@@ -77,6 +78,26 @@ KNOWN_DIRECTORIES: dict[str, str] = {
     "Dalhousie University": "https://dsu.ca/clubs-societies",
     "University of Manitoba": "https://umsu.ca/clubs/",
 }
+
+# Hardcoded QS-ranked Canadian universities (offline fallback)
+# Source: QS World University Rankings 2025 — top 15 Canadian universities
+QS_TOP_CANADIAN: list[dict] = [
+    {"university": "University of Toronto", "province": "Ontario"},
+    {"university": "McGill University", "province": "Quebec"},
+    {"university": "University of British Columbia", "province": "British Columbia"},
+    {"university": "University of Alberta", "province": "Alberta"},
+    {"university": "University of Waterloo", "province": "Ontario"},
+    {"university": "Western University", "province": "Ontario"},
+    {"university": "University of Montreal", "province": "Quebec"},
+    {"university": "McMaster University", "province": "Ontario"},
+    {"university": "University of Ottawa", "province": "Ontario"},
+    {"university": "Queen's University", "province": "Ontario"},
+    {"university": "University of Calgary", "province": "Alberta"},
+    {"university": "Simon Fraser University", "province": "British Columbia"},
+    {"university": "Dalhousie University", "province": "Nova Scotia"},
+    {"university": "York University", "province": "Ontario"},
+    {"university": "University of Manitoba", "province": "Manitoba"},
+]
 
 # amsclubs.ca-specific constants
 AMS_CLUBS_BASE = "https://amsclubs.ca"
@@ -186,104 +207,326 @@ def run_smoke_test(client: ParallelClient):
 
 
 # =========================================================================
-# STAGE 1: Resolve University Directory URL
+# STAGE 1: Discover Top N Canadian Universities (FindAll or single-uni)
 # =========================================================================
 
-def run_stage1(client: ParallelClient, university: str) -> list[dict]:
-    """Resolve the target university's clubs directory URL.
+def run_stage1(
+    client: ParallelClient,
+    university: str | None = None,
+    top_n: int = 10,
+) -> list[dict]:
+    """Discover target universities and their clubs directory URLs.
 
-    If the university is in KNOWN_DIRECTORIES, we use the cached URL.
-    Otherwise, we use Search + Chat to find it.
+    Two modes:
+      • **Single-uni** (``--university "McGill University"``): Resolves one
+        university via KNOWN_DIRECTORIES or Search+Chat.  Fast, 0-2 API calls.
+      • **Top-N** (default): Uses FindAll to discover the top *N* Canadian
+        universities by QS ranking, then resolves directory URLs for each.
+
+    Returns:
+        List of uni dicts with keys: university, province, estimated_club_count,
+        clubs_directory_url, source_urls.
     """
     print("\n" + "=" * 60)
-    print(f"STAGE 1: Resolve Directory URL for {university}")
+    if university:
+        print(f"STAGE 1: Resolve Directory URL for {university}")
+    else:
+        print(f"STAGE 1: Discover Top {top_n} Canadian Universities")
     print("=" * 60)
 
-    # Check known directories first
+    # ── Single-university fast path ──────────────────────────
+    if university:
+        uni_data = _resolve_single_university(client, university)
+        result = [uni_data]
+        save_checkpoint(result, STAGE1_FILE)
+        print(f"\nTotal API calls so far: {client.call_count}")
+        return result
+
+    # ── FindAll top-N path (with Chat fallback) ────────────────
+    universities: list[dict] = []
+    findall_ok = False
+
+    try:
+        print(f"\n  🔍 Using FindAll to discover top {top_n} Canadian universities...")
+        objective = (
+            f"Find the top {top_n} Canadian universities ranked by the "
+            f"QS World University Rankings.  For each university, provide "
+            f"its name, province, and a URL for its student clubs directory."
+        )
+
+        # Step A: Ingest objective into FindAll schema
+        schema = client.findall_ingest(objective)
+        entity_type = schema.get("entity_type", "universities")
+        match_conditions = schema.get("match_conditions", [])
+
+        # Ensure we always filter for Canadian + ranking
+        mc_texts = " ".join(mc.get("description", "") for mc in match_conditions).lower()
+        if "canad" not in mc_texts:
+            match_conditions.append({
+                "name": "canadian_university",
+                "description": "Must be a university located in Canada.",
+            })
+        if "rank" not in mc_texts and "qs" not in mc_texts:
+            match_conditions.append({
+                "name": "qs_ranked",
+                "description": (
+                    "Must be a top university appearing in the QS World "
+                    "University Rankings."
+                ),
+            })
+
+        print(f"  Entity type: {entity_type}")
+        print(f"  Match conditions ({len(match_conditions)}):")
+        for mc in match_conditions:
+            print(f"    • {mc['name']}: {mc['description'][:80]}")
+
+        # Step B: Create and poll FindAll run
+        findall_id = client.findall_create_run(
+            objective=objective,
+            entity_type=entity_type,
+            match_conditions=match_conditions,
+            generator="base",
+            match_limit=max(5, top_n + 5),  # small buffer
+            metadata={"stage": "1_universities"},
+        )
+
+        print("\n  Polling for completion...")
+        status = client.poll_findall_run(
+            findall_id=findall_id,
+            poll_interval=5.0,
+            timeout=180.0,
+        )
+
+        timed_out = status.get("timed_out", False)
+        metrics = status.get("metrics", {})
+        matched = metrics.get("matched_candidates_count", 0)
+        if timed_out:
+            print(f"\n  ⚠ Timed out — got {matched} matches")
+        else:
+            print(f"\n  ✅ Complete: {matched} matches")
+
+        # Step C: Fetch and convert results
+        candidates = client.get_findall_results(findall_id)
+
+        for cand in candidates[:top_n]:
+            name = cand.get("name", "")
+            dir_url = KNOWN_DIRECTORIES.get(name, cand.get("url", ""))
+            source_urls = []
+            for b in cand.get("basis", []):
+                for cit in b.get("citations", []):
+                    u = cit.get("url", "")
+                    if u and u not in source_urls:
+                        source_urls.append(u)
+
+            universities.append({
+                "university": name,
+                "province": "",
+                "estimated_club_count": 0,
+                "clubs_directory_url": dir_url,
+                "source_urls": source_urls,
+            })
+            print(f"  {len(universities):>2}. {name:40s} → {dir_url[:60]}")
+
+        findall_ok = True
+
+    except Exception as e:
+        logger.warning(f"FindAll failed: {e}")
+        print(f"\n  ⚠ FindAll unavailable ({e})")
+        print(f"  Falling back to Chat-based university discovery...")
+
+    # ── Chat fallback if FindAll failed or returned nothing ───
+    if not findall_ok or not universities:
+        try:
+            universities = _discover_universities_chat(client, top_n)
+        except Exception as e:
+            logger.warning(f"Chat fallback also failed: {e}")
+            print(f"\n  ⚠ Chat also unavailable ({e})")
+            print(f"  Using hardcoded QS rankings as final fallback...")
+
+    # ── Hardcoded fallback if both FindAll and Chat failed ───
+    if not universities:
+        for qs in QS_TOP_CANADIAN[:top_n]:
+            name = qs["university"]
+            dir_url = KNOWN_DIRECTORIES.get(name, "")
+            universities.append({
+                "university": name,
+                "province": qs["province"],
+                "estimated_club_count": 0,
+                "clubs_directory_url": dir_url,
+                "source_urls": [],
+            })
+            marker = "" if dir_url else " (no known directory)"
+            print(f"  {len(universities):>2}. {name:40s} {qs['province']}{marker}")
+
+    # If fewer than top_n, pad with KNOWN_DIRECTORIES
+    found_names = {u["university"] for u in universities}
+    for kn_name, kn_url in KNOWN_DIRECTORIES.items():
+        if len(universities) >= top_n:
+            break
+        if kn_name not in found_names:
+            universities.append({
+                "university": kn_name,
+                "province": "",
+                "estimated_club_count": 0,
+                "clubs_directory_url": kn_url,
+                "source_urls": [],
+            })
+            found_names.add(kn_name)
+            print(f"  {len(universities):>2}. {kn_name:40s} → {kn_url[:60]} (fallback)")
+
+    save_checkpoint(universities, STAGE1_FILE)
+    print(f"\n  → {len(universities)} universities resolved")
+    print(f"Total API calls so far: {client.call_count}")
+    return universities
+
+
+def _resolve_single_university(client: ParallelClient, university: str) -> dict:
+    """Resolve a single university's directory URL (fast path)."""
     known_url = KNOWN_DIRECTORIES.get(university, "")
 
     if known_url:
         print(f"  ✅ Known directory URL: {known_url}")
-        uni_data = {
+        return {
             "university": university,
             "province": "",
             "estimated_club_count": 0,
             "clubs_directory_url": known_url,
             "source_urls": [],
         }
-    else:
-        # Search for the directory URL
-        print("  🔍 Searching for clubs directory...")
-        search_result = client.search(
-            objective=(
-                f"Find the official student clubs directory or list of "
-                f"student organizations at {university} in Canada"
-            ),
-            search_queries=[
-                f"{university} student clubs list directory",
-                f"{university} student organizations directory",
-                f"{university} student union clubs",
-            ],
-            max_results=5,
-        )
 
-        # Use Chat to pick the best URL
-        search_urls = [
-            r.get("url", "") for r in search_result.get("results", [])
-            if r.get("url")
-        ]
+    # Search + Chat fallback
+    print("  🔍 Searching for clubs directory...")
+    search_result = client.search(
+        objective=(
+            f"Find the official student clubs directory or list of "
+            f"student organizations at {university} in Canada"
+        ),
+        search_queries=[
+            f"{university} student clubs list directory",
+            f"{university} student organizations directory",
+            f"{university} student union clubs",
+        ],
+        max_results=5,
+    )
 
-        schema = {
-            "type": "object",
-            "properties": {
-                "university": {"type": "string"},
-                "province": {"type": "string"},
-                "estimated_club_count": {
-                    "type": "integer",
-                    "description": "Estimated number of student clubs",
-                },
-                "clubs_directory_url": {
-                    "type": "string",
-                    "description": "The URL of the student clubs directory page",
-                },
+    search_urls = [
+        r.get("url", "") for r in search_result.get("results", [])
+        if r.get("url")
+    ]
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "university": {"type": "string"},
+            "province": {"type": "string"},
+            "estimated_club_count": {
+                "type": "integer",
+                "description": "Estimated number of student clubs",
             },
-            "required": [
-                "university", "province",
-                "estimated_club_count", "clubs_directory_url",
-            ],
-        }
+            "clubs_directory_url": {
+                "type": "string",
+                "description": "The URL of the student clubs directory page",
+            },
+        },
+        "required": [
+            "university", "province",
+            "estimated_club_count", "clubs_directory_url",
+        ],
+    }
 
-        url_list = "\n".join(f"  - {u}" for u in search_urls[:5])
-        parsed, basis = client.chat_json(
-            prompt=(
-                f"For {university} (Canada), find:\n"
-                f"1. The province it's in\n"
-                f"2. Estimated number of student clubs\n"
-                f"3. The best URL for their student clubs directory\n\n"
-                f"Candidate URLs from search:\n{url_list}\n\n"
-                f"Pick the URL that leads to the actual clubs listing page."
-            ),
-            schema=schema,
-            schema_name="university_info",
-            model="base",
-        )
+    url_list = "\n".join(f"  - {u}" for u in search_urls[:5])
+    parsed, basis = client.chat_json(
+        prompt=(
+            f"For {university} (Canada), find:\n"
+            f"1. The province it's in\n"
+            f"2. Estimated number of student clubs\n"
+            f"3. The best URL for their student clubs directory\n\n"
+            f"Candidate URLs from search:\n{url_list}\n\n"
+            f"Pick the URL that leads to the actual clubs listing page."
+        ),
+        schema=schema,
+        schema_name="university_info",
+        model="base",
+    )
 
-        source_urls = ParallelClient.extract_source_urls(basis)
-        uni_data = {
-            "university": parsed.get("university", university),
-            "province": parsed.get("province", ""),
-            "estimated_club_count": parsed.get("estimated_club_count", 0),
-            "clubs_directory_url": parsed.get("clubs_directory_url", ""),
+    source_urls = ParallelClient.extract_source_urls(basis)
+    uni_data = {
+        "university": parsed.get("university", university),
+        "province": parsed.get("province", ""),
+        "estimated_club_count": parsed.get("estimated_club_count", 0),
+        "clubs_directory_url": parsed.get("clubs_directory_url", ""),
+        "source_urls": source_urls,
+    }
+    print(f"  → Directory URL: {uni_data['clubs_directory_url']}")
+    print(f"  → Province: {uni_data['province']}")
+    print(f"  → Estimated clubs: {uni_data['estimated_club_count']}")
+    return uni_data
+
+
+def _discover_universities_chat(
+    client: ParallelClient,
+    top_n: int = 10,
+) -> list[dict]:
+    """Discover top N Canadian universities via Chat API (FindAll fallback).
+
+    Uses the Chat (base) model to research QS-ranked universities, then
+    overlays KNOWN_DIRECTORIES for clubs directory URLs.
+    """
+    print(f"\n  🤖 Using Chat to discover top {top_n} Canadian universities...")
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "universities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "province": {"type": "string"},
+                    },
+                    "required": ["name", "province"],
+                },
+            }
+        },
+        "required": ["universities"],
+    }
+
+    parsed, basis = client.chat_json(
+        prompt=(
+            f"List the top {top_n} Canadian universities by the latest "
+            f"QS World University Rankings. For each, provide the official "
+            f"university name and the Canadian province it is in."
+        ),
+        schema=schema,
+        schema_name="top_universities",
+        model="base",
+        system_prompt=(
+            "You are a higher-education researcher. Return only universities "
+            "in Canada. Use official names (e.g., 'University of British "
+            "Columbia' not 'UBC')."
+        ),
+    )
+
+    source_urls = ParallelClient.extract_source_urls(basis)
+    universities: list[dict] = []
+
+    for u in parsed.get("universities", [])[:top_n]:
+        name = u.get("name", "")
+        if not name:
+            continue
+        dir_url = KNOWN_DIRECTORIES.get(name, "")
+        universities.append({
+            "university": name,
+            "province": u.get("province", ""),
+            "estimated_club_count": 0,
+            "clubs_directory_url": dir_url,
             "source_urls": source_urls,
-        }
-        print(f"  → Directory URL: {uni_data['clubs_directory_url']}")
-        print(f"  → Province: {uni_data['province']}")
-        print(f"  → Estimated clubs: {uni_data['estimated_club_count']}")
+        })
+        marker = "" if dir_url else " (no known directory)"
+        print(f"  {len(universities):>2}. {name:40s} {u.get('province', '')}{marker}")
 
-    result = [uni_data]
-    save_checkpoint(result, STAGE1_FILE)
-    print(f"\nTotal API calls so far: {client.call_count}")
-    return result
+    return universities
 
 
 # =========================================================================
@@ -422,15 +665,14 @@ def run_stage2(
     resume: bool = False,
     timeout: float = 45.0,
 ) -> list[dict]:
-    """Enumerate up to max_clubs at the target university.
+    """Enumerate clubs at EVERY university from Stage 1.
 
-    For UBC (amsclubs.ca), directly extracts the paginated club directory
-    for comprehensive coverage of all 449+ clubs.  For other universities,
-    falls back to the generic Search → Extract → Chat pipeline.
+    For UBC (amsclubs.ca), directly parses the Yoast sitemap (0 API calls).
+    For other universities, uses the Search → Extract → Chat pipeline.
 
     Args:
-        timeout: Wallclock limit in seconds for the generic pipeline.
-                 Not applied to the amsclubs.ca path (it's fast enough).
+        max_clubs: Maximum clubs to find *per university*.
+        timeout: Wallclock limit in seconds per university (generic path only).
     """
     print("\n" + "=" * 60)
     print("STAGE 2: Enumerate Clubs")
@@ -442,36 +684,64 @@ def run_stage2(
         print("❌ Stage 1 checkpoint not found. Run --stage 1 first.")
         sys.exit(1)
 
-    uni = universities[0]  # Single university in v2
-    uni_name = uni["university"]
-
-    # Check for existing Stage 2 data
+    # Resume support
+    all_clubs: list[dict] = []
     if resume:
         existing = load_checkpoint(STAGE2_FILE)
         if existing:
-            print(f"Resuming: {len(existing)} clubs already found")
-            return existing
+            all_clubs = existing
+            done_unis = {c["university"] for c in existing}
+            universities = [u for u in universities if u["university"] not in done_unis]
+            print(f"Resuming: {len(existing)} clubs already found, "
+                  f"{len(universities)} universities remaining")
+            if not universities:
+                return all_clubs
 
-    print(f"\nProcessing: {uni_name}")
+    print(f"\nUniversities to process: {len(universities)}")
 
-    # ── amsclubs.ca fast path (UBC) ────────────────────────────
-    dir_url = uni.get("clubs_directory_url", "")
-    if "amsclubs.ca" in dir_url:
-        print(f"  🏫 Detected amsclubs.ca directory — using direct extraction")
-        clubs = _extract_amsclubs_directory(client, max_clubs=max_clubs)
+    for idx, uni in enumerate(universities, 1):
+        uni_name = uni["university"]
+        dir_url = uni.get("clubs_directory_url", "")
+
+        print(f"\n{'─' * 50}")
+        print(f"[{idx}/{len(universities)}] {uni_name}")
+
+        # ── amsclubs.ca fast path (UBC) ────────────────────────
+        if "amsclubs.ca" in dir_url:
+            print(f"  🏫 amsclubs.ca sitemap — 0 API calls")
+            clubs = _extract_amsclubs_directory(client, max_clubs=max_clubs)
+        else:
+            # ── Generic path ───────────────────────────────────
+            clubs = _enumerate_clubs_generic(
+                client, uni, max_clubs=max_clubs, timeout=timeout,
+            )
 
         # Annotate each club
         for club in clubs:
             club["university"] = uni_name
-            club["province"] = uni.get("province", "") or "British Columbia"
-            club["source_urls"] = [club.get("club_website", "")]
+            club["province"] = uni.get("province", "")
+            if not club.get("source_urls"):
+                club["source_urls"] = [club.get("club_website", "")]
 
-        print(f"  → Found {len(clubs)} clubs at {uni_name}")
-        save_checkpoint(clubs, STAGE2_FILE)
-        print(f"\nTotal API calls so far: {client.call_count}")
-        return clubs
+        all_clubs.extend(clubs)
+        print(f"  → {len(clubs)} clubs at {uni_name}  (running total: {len(all_clubs)})")
+        save_checkpoint(all_clubs, STAGE2_FILE)
 
-    # ── Generic path (non-amsclubs universities) ───────────────
+    print(f"\n{'=' * 50}")
+    print(f"Stage 2 complete: {len(all_clubs)} total clubs across "
+          f"{len({c['university'] for c in all_clubs})} universities")
+    print(f"Total API calls so far: {client.call_count}")
+    return all_clubs
+
+
+def _enumerate_clubs_generic(
+    client: ParallelClient,
+    uni: dict,
+    max_clubs: int = 100,
+    timeout: float = 45.0,
+) -> list[dict]:
+    """Generic Search → Extract → Chat pipeline for one university."""
+    uni_name = uni["university"]
     stage2_start = time.time()
 
     def _remaining() -> float:
@@ -488,7 +758,8 @@ def run_stage2(
             f"{uni_name} student organizations directory",
             f"{uni_name} student union clubs",
         ],
-        max_results=5,
+        max_results=3,
+        mode="fast",
     )
 
     # Collect URLs to extract
@@ -553,11 +824,15 @@ def run_stage2(
             f"Focus on active clubs that are likely to have sponsorship needs."
         )
 
+    # Use 'speed' model when we have content (just parsing), 'base' when
+    # the model needs to do its own web research.
+    chat_model = "speed" if extracted_content else "base"
+
     parsed, basis = client.chat_json(
         prompt=prompt,
         schema=STAGE2_SCHEMA,
         schema_name="clubs_list",
-        model="base",
+        model=chat_model,
         system_prompt=(
             "You are a research assistant cataloging student clubs at a "
             "Canadian university. Only include clubs you have evidence "
@@ -566,158 +841,14 @@ def run_stage2(
     )
 
     elapsed = time.time() - stage2_start
-    print(f"  Stage 2 completed in {elapsed:.1f}s (limit: {timeout}s)")
+    print(f"  Generic pipeline completed in {elapsed:.1f}s (limit: {timeout}s)")
 
     clubs = parsed.get("clubs", [])[:max_clubs]
 
-    # Extract source URLs from basis (fixed extraction)
     source_urls = ParallelClient.extract_source_urls(basis)
-
-    # Annotate each club with university info
     for club in clubs:
-        club["university"] = uni_name
-        club["province"] = uni.get("province", "")
         club["source_urls"] = source_urls
 
-    print(f"  → Found {len(clubs)} clubs at {uni_name}")
-
-    save_checkpoint(clubs, STAGE2_FILE)
-    print(f"\nTotal API calls so far: {client.call_count}")
-    return clubs
-
-
-# =========================================================================
-# STAGE 2 (FindAll): Discover Clubs via FindAll API
-# =========================================================================
-
-def run_stage2_findall(
-    client: ParallelClient,
-    max_clubs: int = 100,
-    resume: bool = False,
-) -> list[dict]:
-    """Discover clubs at the target university using the FindAll API.
-
-    FindAll handles candidate generation, validation, and (optionally)
-    enrichment in a single async run.  More expensive than the
-    Search→Extract→Chat pipeline ($0.25 + $0.03/match) but tends to
-    find more clubs with built-in citation backing.
-    """
-    print("\n" + "=" * 60)
-    print("STAGE 2: Enumerate Clubs (FindAll API)")
-    print("=" * 60)
-
-    # Load Stage 1 checkpoint
-    universities = load_checkpoint(STAGE1_FILE)
-    if not universities:
-        print("❌ Stage 1 checkpoint not found. Run --stage 1 first.")
-        sys.exit(1)
-
-    uni = universities[0]
-    uni_name = uni["university"]
-
-    if resume:
-        existing = load_checkpoint(STAGE2_FILE)
-        if existing:
-            print(f"Resuming: {len(existing)} clubs already found")
-            return existing
-
-    print(f"\nProcessing: {uni_name}")
-
-    # --- Step A: Ingest – let the API decompose our objective ---
-    objective = (
-        f"FindAll active student clubs and organizations at "
-        f"{uni_name} in Canada"
-    )
-    print(f"  Ingesting objective...")
-    schema = client.findall_ingest(objective)
-
-    entity_type = schema.get("entity_type", "student clubs")
-    match_conditions = schema.get("match_conditions", [])
-
-    # Ensure we always have a university-scoped condition
-    uni_condition_present = any(
-        uni_name.lower() in mc.get("description", "").lower()
-        for mc in match_conditions
-    )
-    if not uni_condition_present:
-        match_conditions.append({
-            "name": "belongs_to_university_check",
-            "description": (
-                f"The club/organization must be officially affiliated with "
-                f"or registered at {uni_name}."
-            ),
-        })
-
-    print(f"  Entity type: {entity_type}")
-    print(f"  Match conditions ({len(match_conditions)}):")
-    for mc in match_conditions:
-        print(f"    • {mc['name']}: {mc['description'][:80]}")
-
-    # --- Step B: Create FindAll run ---
-    match_limit = max(5, min(max_clubs, 1000))
-    estimated_cost = 0.25 + 0.03 * match_limit
-    print(f"\n  Creating FindAll run (base, limit={match_limit})...")
-    print(f"  Estimated max cost: ${estimated_cost:.2f}")
-
-    findall_id = client.findall_create_run(
-        objective=objective,
-        entity_type=entity_type,
-        match_conditions=match_conditions,
-        generator="base",
-        match_limit=match_limit,
-        metadata={"stage": "2_clubs_findall", "university": uni_name},
-    )
-
-    # --- Step C: Poll until complete ---
-    print("\n  Polling for completion...")
-    status = client.poll_findall_run(
-        findall_id=findall_id,
-        poll_interval=5.0,
-        timeout=300.0,
-    )
-
-    timed_out = status.get("timed_out", False)
-    metrics = status.get("metrics", {})
-    generated = metrics.get("generated_candidates_count", 0)
-    matched = metrics.get("matched_candidates_count", 0)
-
-    if timed_out:
-        print(f"\n  ⚠ Timed out — collecting {matched} partial matches "
-              f"({generated} generated)")
-    else:
-        print(f"\n  Complete: {matched} matched ({generated} generated)")
-
-    # --- Step D: Fetch matched candidates ---
-    print("\n  Fetching results...")
-    candidates = client.get_findall_results(findall_id)
-
-    # --- Step E: Convert to our club dict format ---
-    clubs: list[dict] = []
-    for cand in candidates[:max_clubs]:
-        # Extract source URLs from basis
-        source_urls = []
-        for b in cand.get("basis", []):
-            for cit in b.get("citations", []):
-                url = cit.get("url", "")
-                if url and url not in source_urls:
-                    source_urls.append(url)
-
-        # Try to infer category from description
-        club = {
-            "club_name": cand.get("name", ""),
-            "club_description": cand.get("description", ""),
-            "club_website": cand.get("url", ""),
-            "club_category": "",  # may be enriched later
-            "university": uni_name,
-            "province": uni.get("province", ""),
-            "source_urls": source_urls,
-        }
-        clubs.append(club)
-
-    print(f"  → Found {len(clubs)} clubs at {uni_name}")
-
-    save_checkpoint(clubs, STAGE2_FILE)
-    print(f"\nTotal API calls so far: {client.call_count}")
     return clubs
 
 
@@ -814,11 +945,11 @@ def _extract_amsclubs_contacts(
       - An **Our Team** section listing members with Name, Role, and
         sometimes personal email links.
 
-    We batch-Extract 3 URLs at a time, then parse the returned content
+    We batch-Extract 5 URLs at a time, then parse the returned content
     for emails and team members.
     """
     contacts: list[dict] = []
-    batch_size = 3
+    batch_size = 5
     total = len(clubs)
 
     for i in range(0, total, batch_size):
@@ -1092,7 +1223,7 @@ def run_stage3(
         print("\n  Polling for completion...")
         status = client.poll_task_group(
             taskgroup_id=taskgroup_id,
-            poll_interval=5.0,
+            poll_interval=3.0,
             timeout=600.0,
         )
 
@@ -1360,12 +1491,10 @@ def run_stage4():
 # CLI
 # =========================================================================
 
-DEFAULT_UNIVERSITY = "University of British Columbia"
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Canadian Club Sponsorship Lead List Builder (v2)"
+        description="Canadian Club Sponsorship Lead List Builder (v3)"
     )
     parser.add_argument(
         "--test", action="store_true",
@@ -1384,20 +1513,20 @@ def main():
         help="Resume from checkpoint",
     )
     parser.add_argument(
-        "--university", type=str, default=DEFAULT_UNIVERSITY,
-        help=f"Target university (default: {DEFAULT_UNIVERSITY})",
+        "--university", type=str, default=None,
+        help="Single university mode (skip FindAll discovery)",
     )
     parser.add_argument(
-        "--max-clubs", type=int, default=500,
-        help="Max clubs to enumerate (default 500)",
+        "--top-n", type=int, default=10,
+        help="Number of top universities to discover (default 10)",
+    )
+    parser.add_argument(
+        "--max-clubs", type=int, default=50,
+        help="Max clubs per university (default 50)",
     )
     parser.add_argument(
         "--stage2-timeout", type=float, default=45.0,
-        help="Wallclock limit in seconds for Stage 2 (default 45)",
-    )
-    parser.add_argument(
-        "--findall", action="store_true",
-        help="Use FindAll API for Stage 2 club discovery",
+        help="Wallclock limit in seconds per university in Stage 2 (default 45)",
     )
     parser.add_argument(
         "--processor", type=str, default="base-fast",
@@ -1423,21 +1552,18 @@ def main():
 
     for stage in stages_to_run:
         if stage == 1:
-            run_stage1(client, university=args.university)
+            run_stage1(
+                client,
+                university=args.university,
+                top_n=args.top_n,
+            )
         elif stage == 2:
-            if args.findall:
-                run_stage2_findall(
-                    client,
-                    max_clubs=args.max_clubs,
-                    resume=args.resume,
-                )
-            else:
-                run_stage2(
-                    client,
-                    max_clubs=args.max_clubs,
-                    resume=args.resume,
-                    timeout=args.stage2_timeout,
-                )
+            run_stage2(
+                client,
+                max_clubs=args.max_clubs,
+                resume=args.resume,
+                timeout=args.stage2_timeout,
+            )
         elif stage == 3:
             run_stage3(client, resume=args.resume, processor=args.processor)
         elif stage == 4:

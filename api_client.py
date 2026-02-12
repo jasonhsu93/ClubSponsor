@@ -28,7 +28,7 @@ BASE_URL = "https://api.parallel.ai"
 BETA_HEADER = "search-extract-2025-10-10"
 
 # Rate limiting: stay well under 300/min (Chat) and 600/min (Search/Extract)
-DEFAULT_SLEEP = 0.5  # seconds between calls
+DEFAULT_SLEEP = 0.2  # seconds between calls (5 req/s, well under limits)
 
 # Retry settings
 MAX_RETRIES = 3
