@@ -294,19 +294,26 @@ def run_stage1(
         status = client.poll_findall_run(
             findall_id=findall_id,
             poll_interval=5.0,
-            timeout=180.0,
+            timeout=60.0,
+            stall_limit=4,
         )
 
         timed_out = status.get("timed_out", False)
+        stalled = status.get("stalled", False)
         metrics = status.get("metrics", {})
         matched = metrics.get("matched_candidates_count", 0)
-        if timed_out:
+        if stalled:
+            print(f"\n  ⚠ Stalled — {matched} matches (no progress)")
+        elif timed_out:
             print(f"\n  ⚠ Timed out — got {matched} matches")
         else:
             print(f"\n  ✅ Complete: {matched} matches")
 
-        # Step C: Fetch and convert results
-        candidates = client.get_findall_results(findall_id)
+        # Step C: Fetch and convert results (skip if stalled with 0 matches)
+        if matched > 0:
+            candidates = client.get_findall_results(findall_id)
+        else:
+            candidates = []
 
         for cand in candidates[:top_n]:
             name = cand.get("name", "")

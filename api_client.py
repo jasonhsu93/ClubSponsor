@@ -641,17 +641,25 @@ class ParallelClient:
         findall_id: str,
         poll_interval: float = 5.0,
         timeout: float = 300.0,
+        stall_limit: int = 4,
     ) -> dict:
         """Poll a FindAll run until it completes.
 
+        Args:
+            stall_limit: Exit early if generated+matched counts don't change
+                for this many consecutive polls.
+
         Returns:
             Run status dict.  Includes ``"timed_out": True`` if the timeout
-            is reached before the run finishes.
+            is reached, or ``"stalled": True`` if progress plateaued.
         """
         url = f"{self.base_url}/v1beta/findall/runs/{findall_id}"
         headers = self._headers_findall()
         start = time.time()
         status: dict = {}
+        prev_generated = -1
+        prev_matched = -1
+        stall_count = 0
 
         while True:
             elapsed = time.time() - start
@@ -686,6 +694,23 @@ class ParallelClient:
                     f"  FindAll complete: {generated} generated, {matched} matched"
                 )
                 return status
+
+            # Stall detection: exit early if nothing changes
+            if generated == prev_generated and matched == prev_matched:
+                stall_count += 1
+                if stall_count >= stall_limit:
+                    print()
+                    logger.warning(
+                        f"  FindAll stalled: {generated} generated, "
+                        f"{matched} matched — no progress for "
+                        f"{stall_count} polls ({stall_count * poll_interval:.0f}s)"
+                    )
+                    status["stalled"] = True
+                    return status
+            else:
+                stall_count = 0
+            prev_generated = generated
+            prev_matched = matched
 
             time.sleep(poll_interval)
 
